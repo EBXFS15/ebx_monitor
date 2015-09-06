@@ -1,3 +1,11 @@
+/*
+ * Device:
+ *   ls -l /dev/ebx_monitor
+ *
+ * Device Attributes:
+ *   ls -l /sys/devices/virtual/misc/ebx_monitor
+ */
+
 /* --- Includes --- */
 #include <linux/init.h>    /* Funktionseigenschaften */
 #include <linux/module.h>  /* Modulinfrastruktur */
@@ -10,6 +18,7 @@
 #include <linux/sched.h>   /* struct task_struct */
 #include <linux/miscdevice.h> /* struct miscdevice */
 
+#include <linux/string.h> /* strlen */
 #include <linux/device.h>
 
 #include <linux/ktime.h>
@@ -36,12 +45,13 @@ MODULE_DESCRIPTION("EBX Monitor");
 
 static int ebx_monitor_open(struct inode* inodeP, struct file* fileP);
 static int ebx_monitor_release(struct inode* inodeP, struct file* fileP);
+static ssize_t ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_pos);
 
 static struct file_operations cdev_fops = {
   .owner   = THIS_MODULE,
   .open    = ebx_monitor_open,
   .release = ebx_monitor_release,
-  .read    = NULL,
+  .read    = ebx_monitor_read,
   .write   = NULL,
   .llseek  = no_llseek
 };
@@ -61,15 +71,26 @@ static atomic_t totalFrameCount_atomic  = ATOMIC_INIT(0);
 static atomic_t totalFrameDelta_atomic  = ATOMIC_INIT(0);
 static atomic_t lastFrameDelta_atomic   = ATOMIC_INIT(0);
 static atomic_t averageFrameTime_atomic = ATOMIC_INIT(0);
+static atomic_t readOneShot_atomic      = ATOMIC_INIT(0);
 
 #if USE_TIMER_FOR_FRAME_SIMULATION
 #include <linux/timer.h>   /* *_timer_* */
 static struct timer_list ourTimer;
 #endif
 
+/* Device data structure */
+static struct mutex      ebx_monitor_lock;  /* mutex for access exclusion */
+static wait_queue_head_t ebx_monitor_readq; /* read queue for blocking */
+static ssize_t           ebx_monitor_count; /* number of bytes to be read */
+
+/* DEBUG START */
+static char hello[] = "Hello";
+static bool message_read; /* just for testing using cat */
+/* DEBUG END */
 
 /* --- Function Prototypes --- */
 static int ebx_monitor_createDeviceAttributeFiles(struct device* inDeviceP);
+static void ebx_monitor_measurementsFinished(void);
 
 #if USE_TIMER_FOR_FRAME_SIMULATION
 static void ebx_monitor_timer_expired(unsigned long inData);
@@ -99,6 +120,8 @@ __init ebx_monitor_init(void)
 
   printk(KERN_INFO CHARDEV_NAME": Initialize\n");
 
+  init_waitqueue_head(&ebx_monitor_readq);
+  mutex_init(&ebx_monitor_lock);
 
   if ((result = misc_register(&ebx_monitor_misc))) {
     printk(KERN_WARNING CHARDEV_NAME": error registering!\n");
@@ -111,6 +134,10 @@ __init ebx_monitor_init(void)
 #if USE_TIMER_FOR_FRAME_SIMULATION
   ebx_monitor_initTimer();
 #endif
+
+  /* DEBUG START */
+  ebx_monitor_count = (strlen(hello) + 1);
+  /* DEBUG END */
 
   return result;
 
@@ -191,11 +218,59 @@ DEVICE_ATTR(averageFrameTime, 0444, ebx_monitor_averageFrameTime_show, NULL);
 
 
 
+ssize_t
+ebx_monitor_readOneShot_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+  int readOneShot = atomic_read(&readOneShot_atomic);
+
+  if (readOneShot == 0) {
+    snprintf(buf, 256, "Read one shot is deactivated\n");
+  } else {
+    snprintf(buf, 256, "Read one shot is activated\n");
+  }
+
+  return (strlen(buf)+1);
+} /* ebx_monitor_readOneShot_show */
+
+static ssize_t
+ebx_monitor_readOneShot_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf,
+			      size_t count)
+{
+  unsigned long tmp = 0;
+  int ret = kstrtoul(buf, (unsigned int)0, &tmp);
+  
+  if (ret != 0) {
+    /* something is wrong */
+    tmp = 0;
+  }
+
+  atomic_set(&readOneShot_atomic, (int)tmp);
+
+  /* DEBUG START */
+  if (tmp == 0) {
+    printk(KERN_INFO CHARDEV_NAME": One shot is deactivated\n");
+  } else {
+    printk(KERN_INFO CHARDEV_NAME": One shot is activated\n");
+  }
+  /* DEBUG END */
+
+  return strnlen(buf, count);
+}
+DEVICE_ATTR(readOneShot, 0444, ebx_monitor_readOneShot_show, ebx_monitor_readOneShot_store);
+
+
+
 /* --- STATIC Funtions --- */
 static int
 ebx_monitor_open(struct inode* inodeP, struct file* fileP)
 {
   (void)nonseekable_open(inodeP, fileP);
+
+  /* DEBUG START */
+  message_read = false; /* just for testing using cat */
+  /* DEBUG END */
 
   return 0;
 } /* ebx_monitor_open */
@@ -209,6 +284,112 @@ ebx_monitor_release(struct inode* inodeP, struct file* fileP)
 
   return 0;
 } /* ebx_monitor_release */
+
+
+static ssize_t
+ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_pos)
+{
+  int ret = 0;
+
+  /* DEBUG START */
+  printk(KERN_INFO/*DEBUG*/ CHARDEV_NAME": read by \"%s\" (pid %i)\n",
+	 current->comm,
+	 current->pid);
+  /* DEBUG END */
+
+  /* Get lock or signal restart if interrupted */
+  if (mutex_lock_interruptible(&ebx_monitor_lock)) return -ERESTARTSYS;
+
+  /* Partial reads are unsupported */
+  if (ebx_monitor_count > count) {
+    ret = -EINVAL;
+    goto err;
+  }
+
+  /* The default from 'cat' is to issue multiple reads until the FIFO is
+   *  depleted, readOneShot_atomic avoids that */
+  if (atomic_read(&readOneShot_atomic) && message_read) {
+    mutex_unlock(&ebx_monitor_lock);
+    return 0; /* just for testing using cat */
+  }
+
+
+#if 0
+  /* Return EOF if no data avalable to read */
+  if (ebx_monitor_count == 0) {
+    /* no data available to read */
+    goto err;
+  }
+#endif
+
+  /* DEBUG START */
+  if (fileP->f_flags & O_NONBLOCK) {
+    printk(KERN_INFO CHARDEV_NAME": read access NON blocking\n");
+  } else {
+    printk(KERN_INFO CHARDEV_NAME": read access blocking\n");
+  }
+  /* DEBUG END */
+
+  /* Return -EAGAIN if user requested O_NONBLOCK and no data available */
+  if ((ebx_monitor_count == 0) && (fileP->f_flags & O_NONBLOCK)) {
+    ret = -EAGAIN;
+    goto err;
+  }
+
+  if (!(fileP->f_flags & O_NONBLOCK)) {
+    printk(KERN_INFO CHARDEV_NAME": process blocking read access\n");
+    /* Blocking read in progress */
+    /* The loop is necessary, because wait_event tests are not synchronized */
+    while (ebx_monitor_count == 0) {
+      printk(KERN_INFO CHARDEV_NAME": ... no data available\n");
+      /* Release lock */
+      mutex_unlock(&ebx_monitor_lock);
+
+      /* Wait on read queue, signal restart if interrupted */
+      if (wait_event_interruptible(ebx_monitor_readq, (ebx_monitor_count > 0))) {
+	return -ERESTARTSYS;
+      }
+
+      /* Get lock again */
+      if (mutex_lock_interruptible(&ebx_monitor_lock)) {
+	return -ERESTARTSYS;
+      }
+    } /* while */
+  } /* if (!(fileP->f_flags & O_NONBLOCK)) */
+
+  /* Copy data to user */
+  printk(KERN_INFO CHARDEV_NAME": copy data to user: \"%s\"\n", hello);
+  if (copy_to_user(buf, hello, ebx_monitor_count)) {
+    ret = -EFAULT;
+    goto err;
+  }
+  /* DEBUG START */
+  message_read = true; /* just for testing using cat */
+  /* DEBUG END */
+
+  /* Save state */
+  ret = ebx_monitor_count;
+  *f_pos += ret;
+
+  /* Reset buffer */
+  ebx_monitor_count = 0;
+
+  /* Unlock and signal writers */
+  mutex_unlock(&ebx_monitor_lock);
+  //TODO...trigger possible next statistic...  wake_up_interruptible(&fifodev->writeq);
+  return ret;
+
+ err:
+  mutex_unlock(&ebx_monitor_lock);
+  return ret;
+} /* ebx_monitor_read */
+
+
+static void
+ebx_monitor_measurementsFinished(void)
+{
+  wake_up_interruptible(&ebx_monitor_readq);
+} /* ebx_monitor_measurementsFinished */
 
 
 static int
@@ -232,6 +413,11 @@ ebx_monitor_createDeviceAttributeFiles(struct device* inDeviceP)
   }
 
   result = device_create_file(inDeviceP, &dev_attr_averageFrameTime);
+  if (result != 0) {
+    goto fail;
+  }
+
+  result = device_create_file(inDeviceP, &dev_attr_readOneShot);
   if (result != 0) {
     goto fail;
   }
