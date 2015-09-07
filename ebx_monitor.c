@@ -37,7 +37,7 @@ MODULE_DESCRIPTION("EBX Monitor");
 
 #define CHARDEV_NAME "ebx_monitor"
 
-#define USE_TIMER_FOR_FRAME_SIMULATION 1
+#define USE_TIMER_FOR_FRAME_SIMULATION 0
 
 
 /* --- Type definition --- */
@@ -77,8 +77,6 @@ static struct miscdevice ebx_monitor_misc = {
 };
 
 static ktime_t prevFrame_ktime;
-//static ktime_t newFrame_ktime;
-//static ktime_t frame_ktime;
 
 static atomic_t totalFrameCount_atomic  = ATOMIC_INIT(0);
 static atomic_t totalFrameDelta_atomic  = ATOMIC_INIT(0);
@@ -97,7 +95,6 @@ static wait_queue_head_t ebx_monitor_readq; /* read queue for blocking */
 static ssize_t           ebx_monitor_count; /* number of bytes to be read */
 
 /* DEBUG START */
-static char hello[] = "Measured data retrieved ";
 static bool message_read; /* just for testing using cat */
 /* DEBUG END */
 static int nbrMeasurementPoints = 0;
@@ -158,7 +155,9 @@ __init ebx_monitor_init(void)
   int result = 0;
   unsigned int measurePointSize = sizeof(struct MeasurePointS);
 
-  /* TEST */
+  printk(KERN_INFO CHARDEV_NAME": Initialise\n");
+
+  /* Initialise the measurement function pointers */
   if (nbrMeasurementPoints == 0) {
     ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_easy; 
     ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_easy;
@@ -173,24 +172,25 @@ __init ebx_monitor_init(void)
       result = -ENOMEM;
       goto fail1;
     }
-    measurementIdxMax = nbrMeasurementPoints - 1;
+    measurementIdxMax = nbrMeasurementPoints - 1; /* -1 because the index starts with zero */
   }
   printk(KERN_INFO CHARDEV_NAME": sizeof((struct MeasurePointS) = %d, measurementIdxMax = %d\n",
 	 measurePointSize,
 	 measurementIdxMax);
-  /* TEST */
 
-  printk(KERN_INFO CHARDEV_NAME": Initialize\n");
 
+  /* Initialise wait queue and mutex */
   init_waitqueue_head(&ebx_monitor_readq);
   mutex_init(&ebx_monitor_lock);
 
+  /* Register misc device */
   if ((result = misc_register(&ebx_monitor_misc))) {
     printk(KERN_WARNING CHARDEV_NAME": error registering!\n");
     goto fail2;
   }
 
   /* --- allocate memory for the kernel fifo --- */
+  /* allocate memory only if some measurement points are configured */
   if (nbrMeasurementPoints > 0) {
     printk(KERN_INFO CHARDEV_NAME": Allocate kfifo memory\n");
     result = kfifo_alloc(&ourCharDevFifo, nbrMeasurementPoints * nbrOfCharactersPerMeasurePointMax, GFP_KERNEL);
@@ -214,7 +214,7 @@ __init ebx_monitor_init(void)
 #endif
 
   /* DEBUG START */
-  ebx_monitor_count = (strlen(hello) + 1);
+  ebx_monitor_count = 0;
   /* DEBUG END */
 
   return result;
@@ -239,31 +239,6 @@ void
 ebx_monitor_gotnewframe(const struct timeval* inTimeOfNewFrameP)
 {
   ebx_monitor_gotnewframe_funP(inTimeOfNewFrameP);
-#if 0
-  int idx = -1;
-
-  // TODO: calculation should NOT be done here!!!
-  ktime_t newFrame_ktime = timeval_to_ktime(*inTimeOfNewFrameP);
-  if (prevFrame_ktime.tv64 != 0) {
-    ktime_t delta = ktime_sub(newFrame_ktime, prevFrame_ktime);
-
-    atomic_set(&lastFrameDelta_atomic, (int)ktime_to_us(delta));
-    atomic_add((int)ktime_to_us(delta), &totalFrameDelta_atomic); 
-    atomic_inc(&totalFrameCount_atomic);
-    atomic_set(&averageFrameTime_atomic, (atomic_read(&totalFrameDelta_atomic) / atomic_read(&totalFrameCount_atomic)));
-  }
-
-  /* TEST */
-  idx = atomic_add_return(1, &measureIdx_atomic);
-  if ((idx >= 0) && (idx <= measurementIdxMax)) {
-    printk(KERN_INFO CHARDEV_NAME": gotnewframe(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
-    measureP[idx].id        = newFrame_ktime;
-    measureP[idx].timeStamp = newFrame_ktime;
-  }
-  /* TEST */
-
-  prevFrame_ktime = newFrame_ktime;
-#endif
 } /* ebx_monitor_gotnewframe */
 EXPORT_SYMBOL_GPL(ebx_monitor_gotnewframe);
 
@@ -272,24 +247,6 @@ void
 ebx_monitor_gotframe(const struct timeval* inTimeOfNewFrameP)
 {
   ebx_monitor_gotframe_funP(inTimeOfNewFrameP);
-#if 0
-  int idx = -1;
-
-  ktime_t newFrame_ktime = timeval_to_ktime(*inTimeOfNewFrameP);
-  ktime_t frame_ktime    = ktime_get();
-
-  /* TEST */
-  idx = atomic_add_return(1, &measureIdx_atomic);
-  if ((idx >= 0) && (idx <= measurementIdxMax)) {
-    printk(KERN_INFO CHARDEV_NAME": gotframe(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
-    measureP[idx].id        = newFrame_ktime;
-    measureP[idx].timeStamp = frame_ktime;
-  } else {
-    ebx_monitor_count = (strlen(hello) + 1);
-    ebx_monitor_measurementsFinished();
-  }
-  /* TEST */
-#endif
 } /* ebx_monitor_gotframe */
 EXPORT_SYMBOL_GPL(ebx_monitor_gotframe);
 
@@ -338,7 +295,6 @@ ebx_monitor_averageFrameTime_show(struct device *dev, struct device_attribute *a
 DEVICE_ATTR(averageFrameTime, 0444, ebx_monitor_averageFrameTime_show, NULL);
 
 
-
 ssize_t
 ebx_monitor_readOneShot_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -352,6 +308,7 @@ ebx_monitor_readOneShot_show(struct device *dev, struct device_attribute *attr, 
 
   return (strlen(buf)+1);
 } /* ebx_monitor_readOneShot_show */
+
 
 static ssize_t
 ebx_monitor_readOneShot_store(struct device *dev,
@@ -369,13 +326,12 @@ ebx_monitor_readOneShot_store(struct device *dev,
 
   atomic_set(&readOneShot_atomic, (int)tmp);
 
-  /* DEBUG START */
+  /* DEBUG OUTPUT */
   if (tmp == 0) {
     printk(KERN_INFO CHARDEV_NAME": One shot is deactivated\n");
   } else {
     printk(KERN_INFO CHARDEV_NAME": One shot is activated\n");
   }
-  /* DEBUG END */
 
   return strnlen(buf, count);
 }
@@ -413,23 +369,25 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
   int ret = 0;
   unsigned int copied = 0;
 
-  /* DEBUG START */
-  printk(KERN_INFO/*DEBUG*/ CHARDEV_NAME": read by \"%s\" (pid %i)\n",
+  /* TEST: just activate to simulate partial read access: count = 10; */
+
+  /* DEBUG OUTPUT */
+  printk(KERN_INFO CHARDEV_NAME": read by \"%s\" (pid %i)\n",
 	 current->comm,
 	 current->pid);
-  /* DEBUG END */
 
   /* Get lock or signal restart if interrupted */
   if (mutex_lock_interruptible(&ebx_monitor_lock)) return -ERESTARTSYS;
 
+#if 0 /* Partial read is supported !!! */
   /* Partial reads are unsupported */
   if (ebx_monitor_count > count) {
     ret = -EINVAL;
     goto err;
   }
+#endif
 
-  /* The default from 'cat' is to issue multiple reads
-   * readOneShot_atomic avoids that */
+  /* The default from 'cat' is to issue multiple reads readOneShot_atomic avoids that */
   if (atomic_read(&readOneShot_atomic) && message_read) {
     mutex_unlock(&ebx_monitor_lock);
     return 0; /* just for testing using cat */
@@ -442,13 +400,12 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
     goto err;
   }
 
-  /* DEBUG START */
+  /* DEBUG OUTPUT */
   if (fileP->f_flags & O_NONBLOCK) {
     printk(KERN_INFO CHARDEV_NAME": read access NON blocking\n");
   } else {
     printk(KERN_INFO CHARDEV_NAME": read access blocking\n");
   }
-  /* DEBUG END */
 
   /* Return -EAGAIN if user requested O_NONBLOCK and no data available */
   if ((ebx_monitor_count == 0) && (fileP->f_flags & O_NONBLOCK)) {
@@ -463,6 +420,7 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
     while (ebx_monitor_count == 0) {
       if (nbrMeasurementPoints > 0) {
 	printk(KERN_INFO CHARDEV_NAME": ... no data available, set functions to real\n");
+	/* TODO: is special protection needed to set the function pointers? ....spin lock? */
 	ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_real; 
 	ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_real;
       }
@@ -488,27 +446,20 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 	 copied,
 	 kfifo_len(&ourCharDevFifo));
 
-#if 0
-  printk(KERN_INFO CHARDEV_NAME": copy data to user: \"%s\"\n", hello);
-  if (copy_to_user(buf, hello, ebx_monitor_count)) {
-    ret = -EFAULT;
-    goto err;
-  }
-#endif
-  /* DEBUG START */
+  /* DEBUG: just to test nonblocking access using cat */
   message_read = true; /* just for testing using cat */
   atomic_set(&measureIdx_atomic, -1);
-  /* DEBUG END */
 
   /* Save state */
-  ret = copied; /* ebx_monitor_count; */
+  ret = copied;
   *f_pos += ret;
 
-  /* Reset buffer */
-  ebx_monitor_count = 0;
+  /* Keep on track with delivered data */
+  ebx_monitor_count = ebx_monitor_count - copied;
 
   /* Unlock and signal writers */
   mutex_unlock(&ebx_monitor_lock);
+
   //TODO...trigger possible next statistic...  wake_up_interruptible(&ebx_monitor_writeq);
   return ret ? ret : copied; /* return ret; */
 
@@ -522,6 +473,7 @@ static void
 ebx_monitor_measurementsFinished(void)
 {
   printk(KERN_INFO CHARDEV_NAME": ... data available, set functions to dummy\n");
+  /* TODO: is special protection needed to set the function pointers? ....spin lock? */
   ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_dummy; 
   ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_dummy;
   ebx_monitor_writeDataToFifo();
@@ -544,8 +496,8 @@ ebx_monitor_writeDataToFifo(void)
       printk(KERN_INFO CHARDEV_NAME": ERROR kfifo_in failed\n");
     }
   }
-  printk(KERN_INFO CHARDEV_NAME": kfifo_len = %u\n",
-	 kfifo_len(&ourCharDevFifo));
+  ebx_monitor_count = kfifo_len(&ourCharDevFifo);
+  printk(KERN_INFO CHARDEV_NAME": kfifo_len = %u\n", ebx_monitor_count);
 } /* ebx_monitor_writeDataToFifo */
 
 
@@ -592,15 +544,13 @@ static void
 ebx_monitor_gotnewframe_dummy(const struct timeval* inTimeOfNewFrameP)
 {
   /* printk(KERN_INFO CHARDEV_NAME": gotnewframe_dummy() called\n"); */
-}
+} /* ebx_monitor_gotnewframe_dummy */
 
 static void
 ebx_monitor_gotnewframe_easy(const struct timeval* inTimeOfNewFrameP)
 {
-  // TODO: calculation should NOT be done here!!!
+  /* calculation has a negative influence on performance !!! */
   ktime_t newFrame_ktime = timeval_to_ktime(*inTimeOfNewFrameP);
-
-  /* printk(KERN_INFO CHARDEV_NAME": gotnewframe_easy() called\n"); */
 
   if (prevFrame_ktime.tv64 != 0) {
     ktime_t delta = ktime_sub(newFrame_ktime, prevFrame_ktime);
@@ -620,48 +570,33 @@ ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP)
 {
   int idx = -1;
 
-  // TODO: calculation should NOT be done here!!!
   ktime_t newFrame_ktime = timeval_to_ktime(*inTimeOfNewFrameP);
 
-#if 0
-  if (prevFrame_ktime.tv64 != 0) {
-    ktime_t delta = ktime_sub(newFrame_ktime, prevFrame_ktime);
-
-    atomic_set(&lastFrameDelta_atomic, (int)ktime_to_us(delta));
-    atomic_add((int)ktime_to_us(delta), &totalFrameDelta_atomic); 
-    atomic_inc(&totalFrameCount_atomic);
-    atomic_set(&averageFrameTime_atomic, (atomic_read(&totalFrameDelta_atomic) / atomic_read(&totalFrameCount_atomic)));
-  }
-#endif
-
-  /* TEST */
   idx = atomic_add_return(1, &measureIdx_atomic);
   if ((idx >= 0) && (idx <= measurementIdxMax)) {
     printk(KERN_INFO CHARDEV_NAME": gotnewframe_real(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
     measureP[idx].id        = newFrame_ktime;
     measureP[idx].timeStamp = newFrame_ktime;
   } else {
-    ebx_monitor_count = (strlen(hello) + 1);
     ebx_monitor_measurementsFinished();
   }
-  /* TEST */
 
   prevFrame_ktime = newFrame_ktime;
-}
+} /* ebx_monitor_gotnewframe_real */
 
 
 static void
 ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP)
 {
   /* printk(KERN_INFO CHARDEV_NAME": gotframe_dummy() called\n"); */
-}
+} /* ebx_monitor_gotframe_dummy */
 
 
 void
 ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP)
 {
   /* printk(KERN_INFO CHARDEV_NAME": gotframe_easy() called\n"); */
-}
+} /* ebx_monitor_gotframe_easy */
 
 
 void
@@ -672,17 +607,14 @@ ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP)
   ktime_t newFrame_ktime = timeval_to_ktime(*inTimeOfNewFrameP);
   ktime_t frame_ktime    = ktime_get();
 
-  /* TEST */
   idx = atomic_add_return(1, &measureIdx_atomic);
   if ((idx >= 0) && (idx <= measurementIdxMax)) {
     printk(KERN_INFO CHARDEV_NAME": gotframe_real(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
     measureP[idx].id        = newFrame_ktime;
     measureP[idx].timeStamp = frame_ktime;
   } else {
-    ebx_monitor_count = (strlen(hello) + 1);
     ebx_monitor_measurementsFinished();
   }
-  /* TEST */
 } /* ebx_monitor_gotframe_real */
 
 
