@@ -37,7 +37,7 @@ MODULE_DESCRIPTION("EBX Monitor");
 
 #define CHARDEV_NAME "ebx_monitor"
 
-#define USE_TIMER_FOR_FRAME_SIMULATION 0
+#define USE_TIMER_FOR_FRAME_SIMULATION 1
 
 
 /* --- Type definition --- */
@@ -640,6 +640,9 @@ ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP)
     printk(KERN_INFO CHARDEV_NAME": gotnewframe_real(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
     measureP[idx].id        = newFrame_ktime;
     measureP[idx].timeStamp = newFrame_ktime;
+  } else {
+    ebx_monitor_count = (strlen(hello) + 1);
+    ebx_monitor_measurementsFinished();
   }
   /* TEST */
 
