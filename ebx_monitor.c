@@ -27,6 +27,8 @@
 
 #include <asm/atomic.h>
 
+#include <linux/kfifo.h>   /* use kernel fifo */
+
 
 /* --- Macros and Const definition --- */
 MODULE_LICENSE("GPL");
@@ -47,6 +49,9 @@ struct MeasurePointS {
 static struct MeasurePointS* measureP = NULL;
 static atomic_t measureIdx_atomic     = ATOMIC_INIT(-1);
 static int measurementIdxMax          = 0;
+static int nbrOfCharactersPerMeasurePointMax = 45; /* <19-char>us, <19-char>us\n  = 45 */
+
+DECLARE_KFIFO_PTR(ourCharDevFifo, char);
 
 
 /* --- Variable definition --- */
@@ -96,8 +101,10 @@ static char hello[] = "Measured data retrieved ";
 static bool message_read; /* just for testing using cat */
 /* DEBUG END */
 static int nbrMeasurementPoints = 0;
-module_param(nbrMeasurementPoints, uint, 0);
+module_param(nbrMeasurementPoints, uint, S_IRUGO);
 MODULE_PARM_DESC(nbrMeasurementPoints, "The number of measurement points in the kernel (default=0)");
+
+static int fifoMax = 1024; /* TODO: calculate fifoMax in init, depends on number of "measure points" */
 
 
 /* --- Function Prototypes --- */
@@ -112,6 +119,8 @@ static void ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP);
 static void ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP);
 static void ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP);
 static void (*ebx_monitor_gotframe_funP) (const struct timeval* inTimeOfNewFrameP);
+
+static void ebx_monitor_writeDataToFifo(void);
 
 #if USE_TIMER_FOR_FRAME_SIMULATION
 static void ebx_monitor_timer_expired(unsigned long inData);
@@ -133,6 +142,12 @@ __exit ebx_monitor_exit(void)
   misc_deregister(&ebx_monitor_misc);
   if (measureP != NULL) {
     kfree(measureP);
+  }
+
+  if (nbrMeasurementPoints > 0) {
+    /* free memory used for the kernel fifo */
+    printk(KERN_INFO CHARDEV_NAME": Free kfifo memory\n");
+    kfifo_free(&ourCharDevFifo);
   }
 } /* ebx_monitor_exit */
 
@@ -175,10 +190,23 @@ __init ebx_monitor_init(void)
     goto fail2;
   }
 
+  /* --- allocate memory for the kernel fifo --- */
+  if (nbrMeasurementPoints > 0) {
+    printk(KERN_INFO CHARDEV_NAME": Allocate kfifo memory\n");
+    result = kfifo_alloc(&ourCharDevFifo, nbrMeasurementPoints * nbrOfCharactersPerMeasurePointMax, GFP_KERNEL);
+    if (result != 0) {
+      printk(KERN_ERR CHARDEV_NAME": Error kfifo_alloc failed, result = %d\n", result);
+      goto fail3;
+    }
+    /* read the fifo size, as the size will be rounded-up to a power of 2 */
+    fifoMax = kfifo_size(&ourCharDevFifo);
+    printk(KERN_ERR CHARDEV_NAME": kfifo_size = %d\n", fifoMax);
+  }
+
   /* --- create device attribute files --- */
   result = ebx_monitor_createDeviceAttributeFiles(ebx_monitor_misc.this_device);
   if (result != 0) {
-    goto fail3;
+    goto fail4;
   }
 
 #if USE_TIMER_FOR_FRAME_SIMULATION
@@ -192,6 +220,10 @@ __init ebx_monitor_init(void)
   return result;
 
 
+ fail4:
+  if (nbrMeasurementPoints > 0) {
+    kfifo_free(&ourCharDevFifo);
+  }
  fail3:
   misc_deregister(&ebx_monitor_misc);
  fail2:
@@ -379,6 +411,7 @@ static ssize_t
 ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_pos)
 {
   int ret = 0;
+  unsigned int copied = 0;
 
   /* DEBUG START */
   printk(KERN_INFO/*DEBUG*/ CHARDEV_NAME": read by \"%s\" (pid %i)\n",
@@ -450,18 +483,25 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
   } /* if (!(fileP->f_flags & O_NONBLOCK)) */
 
   /* Copy data to user */
+  ret = kfifo_to_user(&ourCharDevFifo, buf, count, &copied);
+  printk(KERN_INFO CHARDEV_NAME": read(): kfifo_to_user copied %d characters, kfifo_len is now %u\n",
+	 copied,
+	 kfifo_len(&ourCharDevFifo));
+
+#if 0
   printk(KERN_INFO CHARDEV_NAME": copy data to user: \"%s\"\n", hello);
   if (copy_to_user(buf, hello, ebx_monitor_count)) {
     ret = -EFAULT;
     goto err;
   }
+#endif
   /* DEBUG START */
   message_read = true; /* just for testing using cat */
   atomic_set(&measureIdx_atomic, -1);
   /* DEBUG END */
 
   /* Save state */
-  ret = ebx_monitor_count;
+  ret = copied; /* ebx_monitor_count; */
   *f_pos += ret;
 
   /* Reset buffer */
@@ -470,7 +510,7 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
   /* Unlock and signal writers */
   mutex_unlock(&ebx_monitor_lock);
   //TODO...trigger possible next statistic...  wake_up_interruptible(&ebx_monitor_writeq);
-  return ret;
+  return ret ? ret : copied; /* return ret; */
 
  err:
   mutex_unlock(&ebx_monitor_lock);
@@ -484,8 +524,29 @@ ebx_monitor_measurementsFinished(void)
   printk(KERN_INFO CHARDEV_NAME": ... data available, set functions to dummy\n");
   ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_dummy; 
   ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_dummy;
+  ebx_monitor_writeDataToFifo();
   wake_up_interruptible(&ebx_monitor_readq);
 } /* ebx_monitor_measurementsFinished */
+
+
+static void
+ebx_monitor_writeDataToFifo(void)
+{
+  int idx           = 0;
+  ssize_t strLength = 0;
+  char* bufP        = kmalloc(100, GFP_KERNEL);
+
+  for (idx = 0; idx <= measurementIdxMax; idx++) {
+    snprintf(bufP, 100, "%lldus, %lldus\n", ktime_to_us(measureP[idx].id), ktime_to_us(measureP[idx].timeStamp));
+    printk(KERN_INFO CHARDEV_NAME": %s\n", bufP);
+    strLength = strlen(bufP) + 1;
+    if (strLength != kfifo_in(&ourCharDevFifo, bufP, strLength)) {
+      printk(KERN_INFO CHARDEV_NAME": ERROR kfifo_in failed\n");
+    }
+  }
+  printk(KERN_INFO CHARDEV_NAME": kfifo_len = %u\n",
+	 kfifo_len(&ourCharDevFifo));
+} /* ebx_monitor_writeDataToFifo */
 
 
 static int
