@@ -1,10 +1,39 @@
-/*
- * Device:
- *   ls -l /dev/ebx_monitor
+/*******************************************************************************************
+ *  MODULE: ebx_monitor.c
  *
- * Device Attributes:
- *   ls -l /sys/devices/virtual/misc/ebx_monitor
+ *  DESCRIPTION:
+ *    This module implements a  mechanism to collect time stamps (measure points)
+ *    in the Linux kernel using ktime. The <stuct MeasurePointS> defines one measure
+ *    point which includes an <id> (the start ktime value), the <timestamp> and
+ *    a user defined tag value, e.g. to identify specific measure points in the code.
+ *    The kernel module initialisation allocates an array of mesaure points depending
+ *    on the module parameter <nbrMeasurementPoints> and the fifo to allow a user space
+ *    application to read finished measurement results.
+ *    To reduce the negative impact of the measurement the only protection to access
+ *    the array of measure points is the atomic measure point array index.
+ *    A user space application can read the device file in blocking or non-blocking mode,
+ *    e.g. cat cat /dev/ebx_monitor.
+ *
+ *    If the kernel module is loaded without the parameter <nbrMeasurementPoints> (or the
+ *    value set to 0), the easy measure mode is activated. In this mode no measure point
+ *    array and no fifo is allocated, instead the device attributes are updated, e.g.
+ *    cat /sys/devices/virtual/misc/ebx_monitor/averageFrameTime.
+ *    
+ *  DEVICE:
+ *    ls -l /dev/ebx_monitor
+ *
+ *  DEVICE ATTRIBUTES:
+ *    ls -l /sys/devices/virtual/misc/ebx_monitor
+ *
+ *
+ *  AUTHOR: Michel Grundmann
+ *
+ *  HISTORY:
+ *    Date      Author  Description
+ *    20150908  mg      Added a "tag" to the measure point to identify the individual measure points
+ *
  */
+
 
 /* --- Includes --- */
 #include <linux/init.h>    /* Funktionseigenschaften */
@@ -45,11 +74,12 @@ MODULE_DESCRIPTION("EBX Monitor");
 struct MeasurePointS {
   ktime_t id;
   ktime_t timeStamp;
+  unsigned char tag;
 };
 static struct MeasurePointS* measureP = NULL;
 static atomic_t measureIdx_atomic     = ATOMIC_INIT(-1);
 static int measurementIdxMax          = 0;
-static int nbrOfCharactersPerMeasurePointMax = 45; /* <19-char>us, <19-char>us\n  = 45 */
+static int nbrOfCharactersPerMeasurePointMax = 50; /* <19-char>us, <19-char>us, tag\n  = 50 */
 
 DECLARE_KFIFO_PTR(ourCharDevFifo, char);
 
@@ -112,10 +142,10 @@ static void ebx_monitor_gotnewframe_dummy(const struct timeval* inTimeOfNewFrame
 static void ebx_monitor_gotnewframe_easy(const struct timeval* inTimeOfNewFrameP);
 static void (*ebx_monitor_gotnewframe_funP) (const struct timeval* inTimeOfNewFrameP);
 
-static void ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP);
-static void ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP);
-static void ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP);
-static void (*ebx_monitor_gotframe_funP) (const struct timeval* inTimeOfNewFrameP);
+static void ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
+static void ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
+static void ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
+static void (*ebx_monitor_gotframe_funP) (const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
 
 static void ebx_monitor_writeDataToFifo(void);
 
@@ -244,9 +274,9 @@ EXPORT_SYMBOL_GPL(ebx_monitor_gotnewframe);
 
 
 void
-ebx_monitor_gotframe(const struct timeval* inTimeOfNewFrameP)
+ebx_monitor_gotframe(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag)
 {
-  ebx_monitor_gotframe_funP(inTimeOfNewFrameP);
+  ebx_monitor_gotframe_funP(inTimeOfNewFrameP, inTag);
 } /* ebx_monitor_gotframe */
 EXPORT_SYMBOL_GPL(ebx_monitor_gotframe);
 
@@ -489,7 +519,10 @@ ebx_monitor_writeDataToFifo(void)
   char* bufP        = kmalloc(100, GFP_KERNEL);
 
   for (idx = 0; idx <= measurementIdxMax; idx++) {
-    snprintf(bufP, 100, "%lldus, %lldus\n", ktime_to_us(measureP[idx].id), ktime_to_us(measureP[idx].timeStamp));
+    snprintf(bufP, 100, "%lldus, %lldus, %u\n",
+	     ktime_to_us(measureP[idx].id),
+	     ktime_to_us(measureP[idx].timeStamp),
+	     measureP[idx].tag);
     printk(KERN_INFO CHARDEV_NAME": %s\n", bufP);
     strLength = strlen(bufP) + 1;
     if (strLength != kfifo_in(&ourCharDevFifo, bufP, strLength)) {
@@ -577,6 +610,7 @@ ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP)
     printk(KERN_INFO CHARDEV_NAME": gotnewframe_real(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
     measureP[idx].id        = newFrame_ktime;
     measureP[idx].timeStamp = newFrame_ktime;
+    measureP[idx].tag       = 0; /* the tag for a new frame is always zero */
   } else {
     ebx_monitor_measurementsFinished();
   }
@@ -586,21 +620,21 @@ ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP)
 
 
 static void
-ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP)
+ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag)
 {
   /* printk(KERN_INFO CHARDEV_NAME": gotframe_dummy() called\n"); */
 } /* ebx_monitor_gotframe_dummy */
 
 
 void
-ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP)
+ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag)
 {
   /* printk(KERN_INFO CHARDEV_NAME": gotframe_easy() called\n"); */
 } /* ebx_monitor_gotframe_easy */
 
 
 void
-ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP)
+ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag)
 {
   int idx = -1;
 
@@ -612,6 +646,7 @@ ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP)
     printk(KERN_INFO CHARDEV_NAME": gotframe_real(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
     measureP[idx].id        = newFrame_ktime;
     measureP[idx].timeStamp = frame_ktime;
+    measureP[idx].tag       = inTag;
   } else {
     ebx_monitor_measurementsFinished();
   }
@@ -622,6 +657,7 @@ ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP)
 static void
 ebx_monitor_timer_expired(unsigned long inData)
 {
+  static unsigned char ourTag = 0;
   struct timeval newFrameTime;
   do_gettimeofday(&newFrameTime);
 
@@ -630,7 +666,7 @@ ebx_monitor_timer_expired(unsigned long inData)
   ourTimer.expires = get_jiffies_64() + (HZ/30); /* about 33ms = 30fps */
   add_timer(&ourTimer);
 
-  ebx_monitor_gotframe_funP(&newFrameTime);
+  ebx_monitor_gotframe_funP(&newFrameTime, ++ourTag);
 } /* ebx_monitor_timer_expired */
 
 static void
