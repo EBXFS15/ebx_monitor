@@ -7,14 +7,14 @@
  *    point which includes an <id> (the start ktime value), the <timestamp> and
  *    a user defined tag value, e.g. to identify specific measure points in the code.
  *    The kernel module initialisation allocates an array of mesaure points depending
- *    on the module parameter <nbrMeasurementPoints> and the fifo to allow a user space
+ *    on the module parameter <nbrOfMeasurementPoints> and the fifo to allow a user space
  *    application to read finished measurement results.
  *    To reduce the negative impact of the measurement the only protection to access
  *    the array of measure points is the atomic measure point array index.
  *    A user space application can read the device file in blocking or non-blocking mode,
  *    e.g. cat cat /dev/ebx_monitor.
  *
- *    If the kernel module is loaded without the parameter <nbrMeasurementPoints> (or the
+ *    If the kernel module is loaded without the parameter <nbrOfMeasurementPoints> (or the
  *    value set to 0), the easy measure mode is activated. In this mode no measure point
  *    array and no fifo is allocated, instead the device attributes are updated, e.g.
  *    cat /sys/devices/virtual/misc/ebx_monitor/averageFrameTime.
@@ -31,23 +31,27 @@
  *  HISTORY:
  *    Date      Author  Description
  *    20150908  mg      Added a "tag" to the measure point to identify the individual measure points
+ *    20150909  mg      Workqueue to write measure point data from the array to kfifo
+ *                      The behavior of writing the data to the kfifo directly after the finished
+ *                      measure, or deferred (in the workqueue function), can be configured with the
+ *                      module parameter <deferredFifo>.
  *
  */
 
 
 /* --- Includes --- */
-#include <linux/init.h>    /* Funktionseigenschaften */
-#include <linux/module.h>  /* Modulinfrastruktur */
-#include <linux/kernel.h>  /* Kernel-Library */
-#include <linux/cdev.h>    /* character devices */
-#include <linux/fs.h>      /* character devices */
-#include <linux/slab.h>    /* kzalloc */
-#include <asm/uaccess.h>   /* copy_from_user */
-#include <asm/current.h>   /* current is #define current (get_current())) */
-#include <linux/sched.h>   /* struct task_struct */
+#include <linux/init.h>       /* Funktionseigenschaften */
+#include <linux/module.h>     /* Modulinfrastruktur */
+#include <linux/kernel.h>     /* Kernel-Library */
+#include <linux/cdev.h>       /* character devices */
+#include <linux/fs.h>         /* character devices */
+#include <linux/slab.h>       /* kzalloc */
+#include <asm/uaccess.h>      /* copy_from_user */
+#include <asm/current.h>      /* current is #define current (get_current())) */
+#include <linux/sched.h>      /* struct task_struct */
 #include <linux/miscdevice.h> /* struct miscdevice */
 
-#include <linux/string.h> /* strlen */
+#include <linux/string.h>     /* strlen */
 #include <linux/device.h>
 
 #include <linux/ktime.h>
@@ -56,13 +60,13 @@
 
 #include <asm/atomic.h>
 
-#include <linux/kfifo.h>   /* use kernel fifo */
+#include <linux/kfifo.h>      /* use kernel fifo */
 
 
 /* --- Macros and Const definition --- */
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Michel Grundmann");
-MODULE_DESCRIPTION("EBX Monitor");
+MODULE_DESCRIPTION("EBX Monitor to measure execution time in the kernel");
 
 #define CHARDEV_NAME "ebx_monitor"
 
@@ -127,11 +131,15 @@ static ssize_t           ebx_monitor_count; /* number of bytes to be read */
 /* DEBUG START */
 static bool message_read; /* just for testing using cat */
 /* DEBUG END */
-static int nbrMeasurementPoints = 0;
-module_param(nbrMeasurementPoints, uint, S_IRUGO);
-MODULE_PARM_DESC(nbrMeasurementPoints, "The number of measurement points in the kernel (default=0)");
 
-static int fifoMax = 1024; /* TODO: calculate fifoMax in init, depends on number of "measure points" */
+static int nbrOfMeasurementPoints = 0;
+module_param(nbrOfMeasurementPoints, uint, S_IRUGO);
+MODULE_PARM_DESC(nbrOfMeasurementPoints, "The number of measurement points in the kernel (default=0)");
+
+static bool deferredFifo = false;
+module_param(deferredFifo, bool, S_IRUGO);
+MODULE_PARM_DESC(deferredFifo, "Deferred fifo availability (default=N)");
+
 
 
 /* --- Function Prototypes --- */
@@ -155,6 +163,9 @@ static void ebx_monitor_initTimer(void);
 #endif
 
 
+static void workqueue_function(struct work_struct* inDataP);
+static DECLARE_WORK(work, workqueue_function);
+
 /* --- GLOBAL Funtions --- */
 void
 __exit ebx_monitor_exit(void)
@@ -166,12 +177,14 @@ __exit ebx_monitor_exit(void)
   del_timer_sync(&ourTimer);
 #endif
 
+  flush_scheduled_work();
+
   misc_deregister(&ebx_monitor_misc);
   if (measureP != NULL) {
     kfree(measureP);
   }
 
-  if (nbrMeasurementPoints > 0) {
+  if (nbrOfMeasurementPoints > 0) {
     /* free memory used for the kernel fifo */
     printk(KERN_INFO CHARDEV_NAME": Free kfifo memory\n");
     kfifo_free(&ourCharDevFifo);
@@ -182,13 +195,14 @@ __exit ebx_monitor_exit(void)
 int
 __init ebx_monitor_init(void)
 {
-  int result = 0;
+  int result  = 0;
+  int fifoMax = 0;
   unsigned int measurePointSize = sizeof(struct MeasurePointS);
 
   printk(KERN_INFO CHARDEV_NAME": Initialise\n");
 
   /* Initialise the measurement function pointers */
-  if (nbrMeasurementPoints == 0) {
+  if (nbrOfMeasurementPoints == 0) {
     ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_easy; 
     ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_easy;
   } else {
@@ -196,13 +210,13 @@ __init ebx_monitor_init(void)
     ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_real;
   }  
 
-  if (nbrMeasurementPoints > 0) {
-    measureP = (struct MeasurePointS*)(kcalloc(nbrMeasurementPoints, sizeof(struct MeasurePointS), GFP_KERNEL));
+  if (nbrOfMeasurementPoints > 0) {
+    measureP = (struct MeasurePointS*)(kcalloc(nbrOfMeasurementPoints, sizeof(struct MeasurePointS), GFP_KERNEL));
     if (measureP == NULL) {
       result = -ENOMEM;
       goto fail1;
     }
-    measurementIdxMax = nbrMeasurementPoints - 1; /* -1 because the index starts with zero */
+    measurementIdxMax = nbrOfMeasurementPoints - 1; /* -1 because the index starts with zero */
   }
   printk(KERN_INFO CHARDEV_NAME": sizeof((struct MeasurePointS) = %d, measurementIdxMax = %d\n",
 	 measurePointSize,
@@ -221,9 +235,9 @@ __init ebx_monitor_init(void)
 
   /* --- allocate memory for the kernel fifo --- */
   /* allocate memory only if some measurement points are configured */
-  if (nbrMeasurementPoints > 0) {
+  if (nbrOfMeasurementPoints > 0) {
     printk(KERN_INFO CHARDEV_NAME": Allocate kfifo memory\n");
-    result = kfifo_alloc(&ourCharDevFifo, nbrMeasurementPoints * nbrOfCharactersPerMeasurePointMax, GFP_KERNEL);
+    result = kfifo_alloc(&ourCharDevFifo, nbrOfMeasurementPoints * nbrOfCharactersPerMeasurePointMax, GFP_KERNEL);
     if (result != 0) {
       printk(KERN_ERR CHARDEV_NAME": Error kfifo_alloc failed, result = %d\n", result);
       goto fail3;
@@ -251,7 +265,7 @@ __init ebx_monitor_init(void)
 
 
  fail4:
-  if (nbrMeasurementPoints > 0) {
+  if (nbrOfMeasurementPoints > 0) {
     kfifo_free(&ourCharDevFifo);
   }
  fail3:
@@ -424,7 +438,7 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
   }
 
   /* Return EOF if no data avalable to read */
-  if ((ebx_monitor_count == 0) && (nbrMeasurementPoints == 0)) {
+  if ((ebx_monitor_count == 0) && (nbrOfMeasurementPoints == 0)) {
     /* no data available to read */
     printk(KERN_INFO CHARDEV_NAME": ... no data available (running in easy mode, use sys-fs to retrieve data)\n");
     goto err;
@@ -448,7 +462,7 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
     /* Blocking read in progress */
     /* The loop is necessary, because wait_event tests are not synchronized */
     while (ebx_monitor_count == 0) {
-      if (nbrMeasurementPoints > 0) {
+      if (nbrOfMeasurementPoints > 0) {
 	printk(KERN_INFO CHARDEV_NAME": ... no data available, set functions to real\n");
 	/* TODO: is special protection needed to set the function pointers? ....spin lock? */
 	ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_real; 
@@ -506,8 +520,16 @@ ebx_monitor_measurementsFinished(void)
   /* TODO: is special protection needed to set the function pointers? ....spin lock? */
   ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_dummy; 
   ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_dummy;
-  ebx_monitor_writeDataToFifo();
-  wake_up_interruptible(&ebx_monitor_readq);
+
+  if (deferredFifo == true) {
+    if (schedule_work(&work) == 0) {
+      printk(KERN_ERR CHARDEV_NAME": schedule_work NOT successful\n");
+    } else {
+      printk(KERN_ERR CHARDEV_NAME": schedule_work successful\n");
+    }
+  } else {
+    ebx_monitor_writeDataToFifo();
+  }
 } /* ebx_monitor_measurementsFinished */
 
 
@@ -531,6 +553,7 @@ ebx_monitor_writeDataToFifo(void)
   }
   ebx_monitor_count = kfifo_len(&ourCharDevFifo);
   printk(KERN_INFO CHARDEV_NAME": kfifo_len = %u\n", ebx_monitor_count);
+  wake_up_interruptible(&ebx_monitor_readq);
 } /* ebx_monitor_writeDataToFifo */
 
 
@@ -651,6 +674,14 @@ ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP, const unsigne
     ebx_monitor_measurementsFinished();
   }
 } /* ebx_monitor_gotframe_real */
+
+
+static void
+workqueue_function(struct work_struct* inDataP)
+{
+  printk(KERN_INFO CHARDEV_NAME": workqueue_function() triggers ebx_monitor_writeDataToFifo()\n");
+  ebx_monitor_writeDataToFifo();
+} /* workqueue_function */
 
 
 #if USE_TIMER_FOR_FRAME_SIMULATION
