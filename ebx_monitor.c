@@ -18,6 +18,34 @@
  *    value set to 0), the easy measure mode is activated. In this mode no measure point
  *    array and no fifo is allocated, instead the device attributes are updated, e.g.
  *    cat /sys/devices/virtual/misc/ebx_monitor/averageFrameTime.
+ *
+ *    The interface to the monitor, and therefore to perform measures, are the following
+ *    exported functions:
+ *      - ebx_monitor_gotnewframe, to be called on the first measure point
+ *      - ebx_monitor_gotframe, to be called on following measure points
+ *
+ *    The active measurement functionality depends on the following function pointers:
+ *      - ebx_monitor_gotnewframe_funP
+ *      - ebx_monitor_gotframe_funP
+ *
+ *    As soon as a mesurement has been finished the function pointers are set to
+ *    ebx_monitor_gotnewframe_dummy() and ebx_monitor_gotframe_dummy() and no further
+ *    mesurement is done until the data has been read.
+ *
+ *    As soon as the data has been read from the user space application (blocking /
+ *    non-blocking read) the function pointers will be set to the appropriate
+ *    measurement functions and the next measurement starts.
+ *
+ *  MODULE PARAMETERS:
+ *    - nbrOfMeasurementPoints: The number of measurement points in the kernel (default=0, maximum=1000) (uint)
+ *      Defines the number of mesure points, therefore the size of the measueremnt point array
+ *      and the size of the fifo for the user space interface.
+ *    - deferredFifo: Deferred fifo availability (default=N) (bool)
+ *      After a successful measurement the data have to be put into the fifo to be read by the
+ *      user space application. By default this is done directly after the last measurement, as
+ *      part of the function ebx_monitor_gotnewframe() or ebx_monitor_gotframe().
+ *      When <deferredFifo> is set to 'Y' (or '1') this task is delegated to work-queue, to
+ *      reduce the negative impact on the running video stream.
  *    
  *  DEVICE:
  *    ls -l /dev/ebx_monitor
@@ -35,6 +63,11 @@
  *                      The behavior of writing the data to the kfifo directly after the finished
  *                      measure, or deferred (in the workqueue function), can be configured with the
  *                      module parameter <deferredFifo>.
+ *    20150914  mg      Description updated.
+ *                      Number of measure points limited to 1000.
+ *                      Module version added.
+ *                      Added information about memory usage of the monitor.
+ *
  *
  */
 
@@ -64,6 +97,8 @@
 
 
 /* --- Macros and Const definition --- */
+#define EBX_MONITOR_VERSION "1.0"
+MODULE_VERSION(EBX_MONITOR_VERSION);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Michel Grundmann");
 MODULE_DESCRIPTION("EBX Monitor to measure execution time in the kernel");
@@ -132,13 +167,14 @@ static ssize_t           ebx_monitor_count; /* number of bytes to be read */
 static bool message_read; /* just for testing using cat */
 /* DEBUG END */
 
+static int MaxNbrOfMeasurementPoints = 1000;
 static int nbrOfMeasurementPoints = 0;
 module_param(nbrOfMeasurementPoints, uint, S_IRUGO);
-MODULE_PARM_DESC(nbrOfMeasurementPoints, "The number of measurement points in the kernel (default=0)");
+MODULE_PARM_DESC(nbrOfMeasurementPoints, " The number of measurement points in the kernel (default=0, maximum=1000)");
 
 static bool deferredFifo = false;
 module_param(deferredFifo, bool, S_IRUGO);
-MODULE_PARM_DESC(deferredFifo, "Deferred fifo availability (default=N)");
+MODULE_PARM_DESC(deferredFifo, " Deferred fifo availability (default=N)");
 
 
 
@@ -199,7 +235,13 @@ __init ebx_monitor_init(void)
   int fifoMax = 0;
   unsigned int measurePointSize = sizeof(struct MeasurePointS);
 
-  printk(KERN_INFO CHARDEV_NAME": Initialise\n");
+  printk(KERN_INFO CHARDEV_NAME": Initialise (Version "EBX_MONITOR_VERSION")\n");
+
+  /* Limit the number of measure points */
+  if (nbrOfMeasurementPoints > MaxNbrOfMeasurementPoints) {
+    nbrOfMeasurementPoints = MaxNbrOfMeasurementPoints;
+    printk(KERN_INFO CHARDEV_NAME": Measure points limited to %u\n", nbrOfMeasurementPoints);
+  }
 
   /* Initialise the measurement function pointers */
   if (nbrOfMeasurementPoints == 0) {
@@ -221,6 +263,8 @@ __init ebx_monitor_init(void)
   printk(KERN_INFO CHARDEV_NAME": sizeof((struct MeasurePointS) = %d, measurementIdxMax = %d\n",
 	 measurePointSize,
 	 measurementIdxMax);
+  printk(KERN_INFO CHARDEV_NAME": Memory used for measure points = %d Bytes\n",
+	 measurePointSize * nbrOfMeasurementPoints);
 
 
   /* Initialise wait queue and mutex */
@@ -244,7 +288,7 @@ __init ebx_monitor_init(void)
     }
     /* read the fifo size, as the size will be rounded-up to a power of 2 */
     fifoMax = kfifo_size(&ourCharDevFifo);
-    printk(KERN_ERR CHARDEV_NAME": kfifo_size = %d\n", fifoMax);
+    printk(KERN_ERR CHARDEV_NAME": Memory used for fifo = %d Bytes\n", fifoMax);
   }
 
   /* --- create device attribute files --- */
