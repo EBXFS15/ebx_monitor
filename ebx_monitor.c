@@ -57,19 +57,25 @@
  *  AUTHOR: Michel Grundmann
  *
  *  HISTORY:
- *    Date      Author  Description
- *    20150908  mg      Added a "tag" to the measure point to identify the individual measure points
- *    20150909  mg      Workqueue to write measure point data from the array to kfifo
- *                      The behavior of writing the data to the kfifo directly after the finished
- *                      measure, or deferred (in the workqueue function), can be configured with the
- *                      module parameter <deferredFifo>.
- *    20150914  mg      Description updated.
- *                      Number of measure points limited to 1000.
- *                      Module version added.
- *                      Added information about memory usage of the monitor.
+ *    Date      Author  Version  Description
+ *    20150908  mg               Added a "tag" to the measure point to identify the individual measure points
+ *    20150909  mg               Workqueue to write measure point data from the array to kfifo
+ *                               The behavior of writing the data to the kfifo directly after the finished
+ *                               measure, or deferred (in the workqueue function), can be configured with the
+ *                               module parameter <deferredFifo>.
+ *    20150914  mg               Description updated.
+ *                               Number of measure points limited to 1000.
+ *                               Module version added.
+ *                               Added information about memory usage of the monitor.
+ *    20150918  mg      1.2      Mode function pointer protected by spinlock.
+ *                               Only create device attribute files needed for the measurement mode.
+ *                               Remove device attribute files on exit.
  *
  *
  */
+
+
+#define EBX_MONITOR_VERSION "1.2"
 
 
 /* --- Includes --- */
@@ -95,9 +101,10 @@
 
 #include <linux/kfifo.h>      /* use kernel fifo */
 
+#include <linux/spinlock.h>
+
 
 /* --- Macros and Const definition --- */
-#define EBX_MONITOR_VERSION "1.0"
 MODULE_VERSION(EBX_MONITOR_VERSION);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Michel Grundmann");
@@ -121,6 +128,13 @@ static int measurementIdxMax          = 0;
 static int nbrOfCharactersPerMeasurePointMax = 50; /* <19-char>us, <19-char>us, tag\n  = 50 */
 
 DECLARE_KFIFO_PTR(ourCharDevFifo, char);
+
+typedef enum {
+  MonitorModeDummy,
+  MonitorModeEasy,
+  MonitorModeReal,
+  MonitorModeUndef
+} MonitorModeEnum;
 
 
 /* --- Variable definition --- */
@@ -170,26 +184,30 @@ static bool message_read; /* just for testing using cat */
 static int MaxNbrOfMeasurementPoints = 1000;
 static int nbrOfMeasurementPoints = 0;
 module_param(nbrOfMeasurementPoints, uint, S_IRUGO);
-MODULE_PARM_DESC(nbrOfMeasurementPoints, " The number of measurement points in the kernel (default=0, maximum=1000)");
+MODULE_PARM_DESC(nbrOfMeasurementPoints, " The number of measure points in the kernel (default=0, maximum=1000)");
 
 static bool deferredFifo = false;
 module_param(deferredFifo, bool, S_IRUGO);
 MODULE_PARM_DESC(deferredFifo, " Deferred fifo availability (default=N)");
 
+static spinlock_t myMonitorLock;
 
 
 /* --- Function Prototypes --- */
 static int ebx_monitor_createDeviceAttributeFiles(struct device* inDeviceP);
+static void ebx_monitor_removeDeviceAttributeFiles(struct device* inDeviceP);
 static void ebx_monitor_measurementsFinished(void);
 static void ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP);
 static void ebx_monitor_gotnewframe_dummy(const struct timeval* inTimeOfNewFrameP);
 static void ebx_monitor_gotnewframe_easy(const struct timeval* inTimeOfNewFrameP);
-static void (*ebx_monitor_gotnewframe_funP) (const struct timeval* inTimeOfNewFrameP);
+static void (*ebx_monitor_gotnewframe_funP) (const struct timeval* inTimeOfNewFrameP) = ebx_monitor_gotnewframe_dummy;
 
 static void ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
 static void ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
 static void ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
-static void (*ebx_monitor_gotframe_funP) (const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
+static void (*ebx_monitor_gotframe_funP) (const struct timeval* inTimeOfNewFrameP, const unsigned char inTag) = ebx_monitor_gotframe_dummy;
+
+static void ebx_monitor_setMonitorMode(MonitorModeEnum inMode);
 
 static void ebx_monitor_writeDataToFifo(void);
 
@@ -215,6 +233,9 @@ __exit ebx_monitor_exit(void)
 
   flush_scheduled_work();
 
+  /* --- remove device attribute files --- */
+  ebx_monitor_removeDeviceAttributeFiles(ebx_monitor_misc.this_device);
+
   misc_deregister(&ebx_monitor_misc);
   if (measureP != NULL) {
     kfree(measureP);
@@ -234,37 +255,39 @@ __init ebx_monitor_init(void)
   int result  = 0;
   int fifoMax = 0;
   unsigned int measurePointSize = sizeof(struct MeasurePointS);
+  MonitorModeEnum monitorMode = MonitorModeUndef;
+  ebx_monitor_count = 0;
 
   printk(KERN_INFO CHARDEV_NAME": Initialise (Version "EBX_MONITOR_VERSION")\n");
 
-  /* Limit the number of measure points */
-  if (nbrOfMeasurementPoints > MaxNbrOfMeasurementPoints) {
-    nbrOfMeasurementPoints = MaxNbrOfMeasurementPoints;
-    printk(KERN_INFO CHARDEV_NAME": Measure points limited to %u\n", nbrOfMeasurementPoints);
-  }
-
-  /* Initialise the measurement function pointers */
+  /* Initialise the measurement mode */
   if (nbrOfMeasurementPoints == 0) {
-    ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_easy; 
-    ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_easy;
-  } else {
-    ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_real; 
-    ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_real;
-  }  
+    printk(KERN_INFO CHARDEV_NAME": Monitor running in easy mode\n");
+    monitorMode = MonitorModeEasy;
 
-  if (nbrOfMeasurementPoints > 0) {
+  } else {
+    printk(KERN_INFO CHARDEV_NAME": Monitor running in real mode: %u measure points\n", nbrOfMeasurementPoints);
+    monitorMode = MonitorModeReal;
+
+    /* Limit the number of measure points if necessary */
+    if (nbrOfMeasurementPoints > MaxNbrOfMeasurementPoints) {
+      nbrOfMeasurementPoints = MaxNbrOfMeasurementPoints;
+      printk(KERN_INFO CHARDEV_NAME": Measure points limited to %u\n", nbrOfMeasurementPoints);
+    }
+
     measureP = (struct MeasurePointS*)(kcalloc(nbrOfMeasurementPoints, sizeof(struct MeasurePointS), GFP_KERNEL));
     if (measureP == NULL) {
       result = -ENOMEM;
       goto fail1;
     }
     measurementIdxMax = nbrOfMeasurementPoints - 1; /* -1 because the index starts with zero */
-  }
-  printk(KERN_INFO CHARDEV_NAME": sizeof((struct MeasurePointS) = %d, measurementIdxMax = %d\n",
-	 measurePointSize,
-	 measurementIdxMax);
-  printk(KERN_INFO CHARDEV_NAME": Memory used for measure points = %d Bytes\n",
-	 measurePointSize * nbrOfMeasurementPoints);
+
+    printk(KERN_INFO CHARDEV_NAME": sizeof((struct MeasurePointS) = %d, measurementIdxMax = %d\n",
+	   measurePointSize,
+	   measurementIdxMax);
+    printk(KERN_INFO CHARDEV_NAME": Memory used for measure points = %d Bytes\n",
+	   measurePointSize * nbrOfMeasurementPoints);
+  } /* if (nbrOfMeasurementPoints == 0) */
 
 
   /* Initialise wait queue and mutex */
@@ -297,13 +320,12 @@ __init ebx_monitor_init(void)
     goto fail4;
   }
 
+  /* Set the measurement mode: initialise the measurement function pointers depending on mode */
+  ebx_monitor_setMonitorMode(monitorMode);
+
 #if USE_TIMER_FOR_FRAME_SIMULATION
   ebx_monitor_initTimer();
 #endif
-
-  /* DEBUG START */
-  ebx_monitor_count = 0;
-  /* DEBUG END */
 
   return result;
 
@@ -465,7 +487,10 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 	 current->pid);
 
   /* Get lock or signal restart if interrupted */
-  if (mutex_lock_interruptible(&ebx_monitor_lock)) return -ERESTARTSYS;
+  if (mutex_lock_interruptible(&ebx_monitor_lock)) {
+    printk(KERN_INFO CHARDEV_NAME": ... read return -ERESTARTSYS\n");
+    return -ERESTARTSYS;
+  }
 
 #if 0 /* Partial read is supported !!! */
   /* Partial reads are unsupported */
@@ -477,6 +502,7 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 
   /* The default from 'cat' is to issue multiple reads readOneShot_atomic avoids that */
   if (atomic_read(&readOneShot_atomic) && message_read) {
+    printk(KERN_INFO CHARDEV_NAME": ... read, no data available and one shot active\n");
     mutex_unlock(&ebx_monitor_lock);
     return 0; /* just for testing using cat */
   }
@@ -508,9 +534,7 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
     while (ebx_monitor_count == 0) {
       if (nbrOfMeasurementPoints > 0) {
 	printk(KERN_INFO CHARDEV_NAME": ... no data available, set functions to real\n");
-	/* TODO: is special protection needed to set the function pointers? ....spin lock? */
-	ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_real; 
-	ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_real;
+	ebx_monitor_setMonitorMode(MonitorModeReal);
       }
 
       /* Release lock */
@@ -561,9 +585,7 @@ static void
 ebx_monitor_measurementsFinished(void)
 {
   printk(KERN_INFO CHARDEV_NAME": ... data available, set functions to dummy\n");
-  /* TODO: is special protection needed to set the function pointers? ....spin lock? */
-  ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_dummy; 
-  ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_dummy;
+  ebx_monitor_setMonitorMode(MonitorModeDummy);
 
   if (deferredFifo == true) {
     if (schedule_work(&work) == 0) {
@@ -589,7 +611,7 @@ ebx_monitor_writeDataToFifo(void)
 	     ktime_to_us(measureP[idx].id),
 	     ktime_to_us(measureP[idx].timeStamp),
 	     measureP[idx].tag);
-    printk(KERN_INFO CHARDEV_NAME": %s\n", bufP);
+    printk(KERN_INFO CHARDEV_NAME": %s", bufP);
     strLength = strlen(bufP) + 1;
     if (strLength != kfifo_in(&ourCharDevFifo, bufP, strLength)) {
       printk(KERN_INFO CHARDEV_NAME": ERROR kfifo_in failed\n");
@@ -606,38 +628,58 @@ ebx_monitor_createDeviceAttributeFiles(struct device* inDeviceP)
 {
   int result = 0;
 
-  result = device_create_file(inDeviceP, &dev_attr_totalFrameCount);
-  if (result != 0) {
-    goto fail;
-  }
+  /* Only create the sys-fs file when needed */
+  if (nbrOfMeasurementPoints == 0) {
+    result = device_create_file(inDeviceP, &dev_attr_totalFrameCount);
+    if (result != 0) {
+      goto fail;
+    }
 
-  result = device_create_file(inDeviceP, &dev_attr_totalFrameDelta);
-  if (result != 0) {
-    goto fail;
-  }
+    result = device_create_file(inDeviceP, &dev_attr_totalFrameDelta);
+    if (result != 0) {
+      goto fail;
+    }
 
-  result = device_create_file(inDeviceP, &dev_attr_lastFrameDelta);
-  if (result != 0) {
-    goto fail;
-  }
+    result = device_create_file(inDeviceP, &dev_attr_lastFrameDelta);
+    if (result != 0) {
+      goto fail;
+    }
 
-  result = device_create_file(inDeviceP, &dev_attr_averageFrameTime);
-  if (result != 0) {
-    goto fail;
-  }
+    result = device_create_file(inDeviceP, &dev_attr_averageFrameTime);
+    if (result != 0) {
+      goto fail;
+    }
+  } /* if (nbrOfMeasurementPoints > 0) */
 
   result = device_create_file(inDeviceP, &dev_attr_readOneShot);
   if (result != 0) {
     goto fail;
   }
 
-  printk(KERN_INFO "chardev: result of device_create_file: %d\n", result);
+  printk(KERN_INFO CHARDEV_NAME": result of device_create_file: %d\n", result);
   return result;
 
  fail:
   printk(KERN_WARNING CHARDEV_NAME": error in device_create_file\n");
   return result;
 } /* ebx_monitor_createDeviceAttributeFiles */
+
+
+static void
+ebx_monitor_removeDeviceAttributeFiles(struct device* inDeviceP)
+{
+  printk(KERN_INFO CHARDEV_NAME": remove device files\n");
+
+  /* Only remove the sys-fs file when needed */
+  if (nbrOfMeasurementPoints == 0) {
+    device_remove_file(inDeviceP, &dev_attr_totalFrameCount);
+    device_remove_file(inDeviceP, &dev_attr_totalFrameDelta);
+    device_remove_file(inDeviceP, &dev_attr_lastFrameDelta);
+    device_remove_file(inDeviceP, &dev_attr_averageFrameTime);
+  } /* if (nbrOfMeasurementPoints > 0) */
+
+  device_remove_file(inDeviceP, &dev_attr_readOneShot);
+} /* ebx_monitor_removeDeviceAttributeFiles */
 
 
 static void
@@ -718,6 +760,33 @@ ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP, const unsigne
     ebx_monitor_measurementsFinished();
   }
 } /* ebx_monitor_gotframe_real */
+
+
+static void
+ebx_monitor_setMonitorMode(MonitorModeEnum inMode)
+{
+  unsigned long iflags;
+
+  spin_lock_irqsave(&myMonitorLock, iflags);
+
+  switch(inMode) {
+  case MonitorModeEasy:
+    ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_easy;
+    ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_easy;
+    break;
+  case MonitorModeReal:
+    ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_real;
+    ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_real;
+    break;
+  case MonitorModeDummy:
+  default:
+    ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_dummy;
+    ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_dummy;
+    break;
+  }
+
+  spin_unlock_irqrestore(&myMonitorLock, iflags);
+} /* ebx_monitor_setMonitorMode */
 
 
 static void
