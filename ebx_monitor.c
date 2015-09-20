@@ -70,12 +70,14 @@
  *    20150918  mg      1.2      Mode function pointer protected by spinlock.
  *                               Only create device attribute files needed for the measurement mode.
  *                               Remove device attribute files on exit.
+ *    20150918  mg      1.3      Performance improvement: Debug output reduced, see precompiler switch EBX_DEBUG_OUTPUT.
+ *                               Non blocking read access corrected.
  *
  *
  */
 
 
-#define EBX_MONITOR_VERSION "1.2"
+#define EBX_MONITOR_VERSION "1.3"
 
 
 /* --- Includes --- */
@@ -113,6 +115,7 @@ MODULE_DESCRIPTION("EBX Monitor to measure execution time in the kernel");
 #define CHARDEV_NAME "ebx_monitor"
 
 #define USE_TIMER_FOR_FRAME_SIMULATION 0
+#define EBX_DEBUG_OUTPUT 0
 
 
 /* --- Type definition --- */
@@ -177,9 +180,7 @@ static struct mutex      ebx_monitor_lock;  /* mutex for access exclusion */
 static wait_queue_head_t ebx_monitor_readq; /* read queue for blocking */
 static ssize_t           ebx_monitor_count; /* number of bytes to be read */
 
-/* DEBUG START */
 static bool message_read; /* just for testing using cat */
-/* DEBUG END */
 
 static int MaxNbrOfMeasurementPoints = 1000;
 static int nbrOfMeasurementPoints = 0;
@@ -455,9 +456,7 @@ ebx_monitor_open(struct inode* inodeP, struct file* fileP)
 {
   (void)nonseekable_open(inodeP, fileP);
 
-  /* DEBUG START */
   message_read = false; /* just for testing using cat */
-  /* DEBUG END */
 
   return 0;
 } /* ebx_monitor_open */
@@ -481,14 +480,13 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 
   /* TEST: just activate to simulate partial read access: count = 10; */
 
-  /* DEBUG OUTPUT */
-  printk(KERN_INFO CHARDEV_NAME": read by \"%s\" (pid %i)\n",
+  printk(KERN_INFO CHARDEV_NAME"_read: read by \"%s\" (pid %i)\n",
 	 current->comm,
 	 current->pid);
 
   /* Get lock or signal restart if interrupted */
   if (mutex_lock_interruptible(&ebx_monitor_lock)) {
-    printk(KERN_INFO CHARDEV_NAME": ... read return -ERESTARTSYS\n");
+    printk(KERN_INFO CHARDEV_NAME"_read: ...return -ERESTARTSYS\n");
     return -ERESTARTSYS;
   }
 
@@ -502,23 +500,28 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 
   /* The default from 'cat' is to issue multiple reads readOneShot_atomic avoids that */
   if (atomic_read(&readOneShot_atomic) && message_read) {
-    printk(KERN_INFO CHARDEV_NAME": ... read, no data available and one shot active\n");
+    printk(KERN_INFO CHARDEV_NAME"_read: ...no data available and one shot active\n");
     mutex_unlock(&ebx_monitor_lock);
     return 0; /* just for testing using cat */
   }
 
   /* Return EOF if no data avalable to read */
-  if ((ebx_monitor_count == 0) && (nbrOfMeasurementPoints == 0)) {
-    /* no data available to read */
-    printk(KERN_INFO CHARDEV_NAME": ... no data available (running in easy mode, use sys-fs to retrieve data)\n");
-    goto err;
+  if (ebx_monitor_count == 0) {
+    if (nbrOfMeasurementPoints == 0) {    /* no data available to read */
+      printk(KERN_INFO CHARDEV_NAME"_read: ...no data available (running in easy mode, use sys-fs to retrieve data)\n");
+      goto err;
+    } else {
+      if (fileP->f_flags & O_NONBLOCK) {
+        printk(KERN_INFO CHARDEV_NAME"_read: ...no data available, return EOF\n");
+        goto err;
+      }
+    }
   }
 
-  /* DEBUG OUTPUT */
   if (fileP->f_flags & O_NONBLOCK) {
-    printk(KERN_INFO CHARDEV_NAME": read access NON blocking\n");
+    printk(KERN_INFO CHARDEV_NAME"_read: access NON blocking\n");
   } else {
-    printk(KERN_INFO CHARDEV_NAME": read access blocking\n");
+    printk(KERN_INFO CHARDEV_NAME"_read: access blocking\n");
   }
 
   /* Return -EAGAIN if user requested O_NONBLOCK and no data available */
@@ -528,13 +531,13 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
   }
 
   if (!(fileP->f_flags & O_NONBLOCK)) {
-    printk(KERN_INFO CHARDEV_NAME": process blocking read access\n");
+    printk(KERN_INFO CHARDEV_NAME"_read: process blocking read access\n");
     /* Blocking read in progress */
     /* The loop is necessary, because wait_event tests are not synchronized */
+    /* In blocking mode we wait until data are available and deliver the data */
     while (ebx_monitor_count == 0) {
       if (nbrOfMeasurementPoints > 0) {
-	printk(KERN_INFO CHARDEV_NAME": ... no data available, set functions to real\n");
-	ebx_monitor_setMonitorMode(MonitorModeReal);
+	printk(KERN_INFO CHARDEV_NAME"_read: ...no data available...wait for data...\n");
       }
 
       /* Release lock */
@@ -554,11 +557,13 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 
   /* Copy data to user */
   ret = kfifo_to_user(&ourCharDevFifo, buf, count, &copied);
-  printk(KERN_INFO CHARDEV_NAME": read(): kfifo_to_user copied %d characters, kfifo_len is now %u\n",
+#if EBX_DEBUG_OUTPUT
+  printk(KERN_INFO CHARDEV_NAME"_read: kfifo_to_user copied %d characters, kfifo_len is now %u\n",
 	 copied,
 	 kfifo_len(&ourCharDevFifo));
+#endif
 
-  /* DEBUG: just to test nonblocking access using cat */
+  /* just to test nonblocking access using cat */
   message_read = true; /* just for testing using cat */
   atomic_set(&measureIdx_atomic, -1);
 
@@ -568,6 +573,13 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 
   /* Keep on track with delivered data */
   ebx_monitor_count = ebx_monitor_count - copied;
+
+  /* Start new measure when all data has been read */
+  if (ebx_monitor_count == 0) {
+    /* All data has been read (fifo is empty), start next measurement */
+    printk(KERN_INFO CHARDEV_NAME"_read: ...all data read, set real mode\n");
+    ebx_monitor_setMonitorMode(MonitorModeReal);
+  }
 
   /* Unlock and signal writers */
   mutex_unlock(&ebx_monitor_lock);
@@ -584,7 +596,7 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 static void
 ebx_monitor_measurementsFinished(void)
 {
-  printk(KERN_INFO CHARDEV_NAME": ... data available, set functions to dummy\n");
+  printk(KERN_INFO CHARDEV_NAME": measurement finished...data available, set dummy mode\n");
   ebx_monitor_setMonitorMode(MonitorModeDummy);
 
   if (deferredFifo == true) {
@@ -611,14 +623,16 @@ ebx_monitor_writeDataToFifo(void)
 	     ktime_to_us(measureP[idx].id),
 	     ktime_to_us(measureP[idx].timeStamp),
 	     measureP[idx].tag);
+#if EBX_DEBUG_OUTPUT
     printk(KERN_INFO CHARDEV_NAME": %s", bufP);
+#endif
     strLength = strlen(bufP) + 1;
     if (strLength != kfifo_in(&ourCharDevFifo, bufP, strLength)) {
       printk(KERN_INFO CHARDEV_NAME": ERROR kfifo_in failed\n");
     }
   }
   ebx_monitor_count = kfifo_len(&ourCharDevFifo);
-  printk(KERN_INFO CHARDEV_NAME": kfifo_len = %u\n", ebx_monitor_count);
+  printk(KERN_INFO CHARDEV_NAME": data ready to be read (kfifo_len = %u)\n", ebx_monitor_count);
   wake_up_interruptible(&ebx_monitor_readq);
 } /* ebx_monitor_writeDataToFifo */
 
@@ -716,7 +730,9 @@ ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP)
 
   idx = atomic_add_return(1, &measureIdx_atomic);
   if ((idx >= 0) && (idx <= measurementIdxMax)) {
+#if EBX_DEBUG_OUTPUT
     printk(KERN_INFO CHARDEV_NAME": gotnewframe_real(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
+#endif
     measureP[idx].id        = newFrame_ktime;
     measureP[idx].timeStamp = newFrame_ktime;
     measureP[idx].tag       = 0; /* the tag for a new frame is always zero */
@@ -752,7 +768,10 @@ ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP, const unsigne
 
   idx = atomic_add_return(1, &measureIdx_atomic);
   if ((idx >= 0) && (idx <= measurementIdxMax)) {
-    printk(KERN_INFO CHARDEV_NAME": gotframe_real(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
+#if EBX_DEBUG_OUTPUT
+    printk(KERN_INFO CHARDEV_NAME": gotframe_real(), idx = %i: %lldus, %lldus, tag = %u\n",
+	   idx, ktime_to_us(newFrame_ktime), ktime_to_us(frame_ktime), inTag);
+#endif
     measureP[idx].id        = newFrame_ktime;
     measureP[idx].timeStamp = frame_ktime;
     measureP[idx].tag       = inTag;
