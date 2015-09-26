@@ -2,7 +2,7 @@
  *  MODULE: ebx_monitor.c
  *
  *  DESCRIPTION:
- *    This module implements a  mechanism to collect time stamps (measure points)
+ *    This module implements a mechanism to collect time stamps (measure points)
  *    in the Linux kernel using ktime. The <stuct MeasurePointS> defines one measure
  *    point which includes an <id> (the start ktime value), the <timestamp> and
  *    a user defined tag value, e.g. to identify specific measure points in the code.
@@ -13,6 +13,8 @@
  *    the array of measure points is the atomic measure point array index.
  *    A user space application can read the device file in blocking or non-blocking mode,
  *    e.g. cat cat /dev/ebx_monitor.
+ *    A measurement can explicitly be (re)started by writing the command "start" to the
+ *    device, e.g. echo start > /dev/ebx_monitor.
  *
  *    If the kernel module is loaded without the parameter <nbrOfMeasurementPoints> (or the
  *    value set to 0), the easy measure mode is activated. In this mode no measure point
@@ -46,6 +48,11 @@
  *      part of the function ebx_monitor_gotnewframe() or ebx_monitor_gotframe().
  *      When <deferredFifo> is set to 'Y' (or '1') this task is delegated to work-queue, to
  *      reduce the negative impact on the running video stream.
+ *
+ *  MODULE COMMANDS:
+ *    Commands can be written to the module by a simple write access, e.g. echo start > /dev/ebx_monitor.
+ *    Supported commands:
+ *      - start: (re)start a measurement, data ready to be retrieved will be lost.
  *    
  *  DEVICE:
  *    ls -l /dev/ebx_monitor
@@ -72,12 +79,13 @@
  *                               Remove device attribute files on exit.
  *    20150918  mg      1.3      Performance improvement: Debug output reduced, see precompiler switch EBX_DEBUG_OUTPUT.
  *                               Non blocking read access corrected.
+ *    20150926  mg      1.4      Write access to start new measurement implemented, e.g. echo start > /dev/ebx_monitor
  *
  *
  */
 
 
-#define EBX_MONITOR_VERSION "1.3"
+#define EBX_MONITOR_VERSION "1.4"
 
 
 /* --- Includes --- */
@@ -145,13 +153,14 @@ typedef enum {
 static int ebx_monitor_open(struct inode* inodeP, struct file* fileP);
 static int ebx_monitor_release(struct inode* inodeP, struct file* fileP);
 static ssize_t ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_pos);
+static ssize_t ebx_monitor_write(struct file * fileP, const char __user *buf, size_t count, loff_t *f_pos);
 
 static struct file_operations cdev_fops = {
   .owner   = THIS_MODULE,
   .open    = ebx_monitor_open,
   .release = ebx_monitor_release,
   .read    = ebx_monitor_read,
-  .write   = NULL,
+  .write   = ebx_monitor_write,
   .llseek  = no_llseek
 };
 
@@ -565,6 +574,8 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 
   /* just to test nonblocking access using cat */
   message_read = true; /* just for testing using cat */
+
+  /* init the atomic measure array index */
   atomic_set(&measureIdx_atomic, -1);
 
   /* Save state */
@@ -585,12 +596,73 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
   mutex_unlock(&ebx_monitor_lock);
 
   //TODO...trigger possible next statistic...  wake_up_interruptible(&ebx_monitor_writeq);
-  return ret ? ret : copied; /* return ret; */
+  return ret ? ret : copied;
 
  err:
   mutex_unlock(&ebx_monitor_lock);
   return ret;
 } /* ebx_monitor_read */
+
+
+static ssize_t
+ebx_monitor_write(struct file * fileP, const char __user *buf, size_t count, loff_t *f_pos)
+{
+  char cmdStart[] = "start";
+  ssize_t ret     = count;
+  char* cmdP      = NULL;
+
+  printk(KERN_INFO CHARDEV_NAME"_write: write by \"%s\" (pid %i)\n",
+	 current->comm,
+	 current->pid);
+
+  /* Get lock or signal restart if interrupted */
+  if (mutex_lock_interruptible(&ebx_monitor_lock)) {
+    printk(KERN_INFO CHARDEV_NAME"_read: ...return -ERESTARTSYS\n");
+    return -ERESTARTSYS;
+  }
+
+  /* Empty write is NOT allowed */
+  if (count < 1) return -EINVAL;
+
+
+  if (!(cmdP = kzalloc(sizeof(char)*(count + 2), GFP_KERNEL))) {
+    ret = -ENOMEM;
+    goto err;
+  }
+
+  /* Copy data from user to kernel */
+  if (copy_from_user(cmdP, buf, count)) {
+    ret = -EFAULT;
+    goto err;
+  }
+
+  /* check received command */
+  if (strcmp(cmdP, cmdStart) == 1) {
+    /* Start new measurement */
+    printk(KERN_INFO CHARDEV_NAME"_write: received command: %s", cmdP);
+    ebx_monitor_setMonitorMode(MonitorModeDummy);
+    ebx_monitor_count = 0;
+    /* init the atomic measure array index */
+    atomic_set(&measureIdx_atomic, -1);
+    /* clear kfifo */
+    printk(KERN_INFO CHARDEV_NAME"_write: kfifo_len is %u\n",
+	   kfifo_len(&ourCharDevFifo));
+    kfifo_reset(&ourCharDevFifo);
+    printk(KERN_INFO CHARDEV_NAME"_write: kfifo_len is now %u\n",
+	   kfifo_len(&ourCharDevFifo));
+    ebx_monitor_setMonitorMode(MonitorModeReal);
+
+  } else {
+    printk(KERN_INFO CHARDEV_NAME"_write: received NOT supported command \"%s\"\n", cmdP);
+  }
+
+ err:
+  if (cmdP != NULL) {
+    kfree(cmdP);
+  }
+  mutex_unlock(&ebx_monitor_lock);
+  return ret;
+} /* ebx_monitor_write */
 
 
 static void
@@ -786,25 +858,32 @@ ebx_monitor_setMonitorMode(MonitorModeEnum inMode)
 {
   unsigned long iflags;
 
-  spin_lock_irqsave(&myMonitorLock, iflags);
-
   switch(inMode) {
   case MonitorModeEasy:
+    spin_lock_irqsave(&myMonitorLock, iflags);
     ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_easy;
     ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_easy;
+    spin_unlock_irqrestore(&myMonitorLock, iflags);
     break;
   case MonitorModeReal:
+    printk(KERN_INFO CHARDEV_NAME": --- START Measurement ---\n");
+    spin_lock_irqsave(&myMonitorLock, iflags);
     ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_real;
     ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_real;
+    spin_unlock_irqrestore(&myMonitorLock, iflags);
     break;
   case MonitorModeDummy:
-  default:
+    printk(KERN_INFO CHARDEV_NAME": --- STOP Measurement ---\n");
+    spin_lock_irqsave(&myMonitorLock, iflags);
     ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_dummy;
     ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_dummy;
+    spin_unlock_irqrestore(&myMonitorLock, iflags);
+    break;
+  default:
+    printk(KERN_INFO CHARDEV_NAME"_setMonitorMode: UNKNOWN mode\n");
     break;
   }
 
-  spin_unlock_irqrestore(&myMonitorLock, iflags);
 } /* ebx_monitor_setMonitorMode */
 
 
