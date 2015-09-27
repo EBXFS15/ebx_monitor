@@ -9,12 +9,14 @@
  *    The kernel module initialisation allocates an array of mesaure points depending
  *    on the module parameter <nbrOfMeasurementPoints> and the fifo to allow a user space
  *    application to read finished measurement results.
- *    To reduce the negative impact of the measurement the only protection to access
- *    the array of measure points is the atomic measure point array index.
+ *    To reduce the negative impact of the measurement all the memory needed to perform
+ *    a measurement and provide the data to the user space application is allocated during
+ *    module initialisation, and the only protection to access the array of measure points
+ *    is the atomic measure point array index (measureIdx_atomic).
  *    A user space application can read the device file in blocking or non-blocking mode,
  *    e.g. cat cat /dev/ebx_monitor.
  *    A measurement can explicitly be (re)started by writing the command "start" to the
- *    device, e.g. echo start > /dev/ebx_monitor.
+ *    device, e.g. echo start > /dev/ebx_monitor (the string just has to begin with "start").
  *
  *    If the kernel module is loaded without the parameter <nbrOfMeasurementPoints> (or the
  *    value set to 0), the easy measure mode is activated. In this mode no measure point
@@ -32,7 +34,7 @@
  *
  *    As soon as a mesurement has been finished the function pointers are set to
  *    ebx_monitor_gotnewframe_dummy() and ebx_monitor_gotframe_dummy() and no further
- *    mesurement is done until the data has been read.
+ *    mesurement is done until the data has been read (data are protected in this state).
  *
  *    As soon as the data has been read from the user space application (blocking /
  *    non-blocking read) the function pointers will be set to the appropriate
@@ -82,12 +84,14 @@
  *    20150926  mg      1.4      Write access to start new measurement implemented, e.g. echo start > /dev/ebx_monitor
  *    20150926  mg      1.5      Corrected device file access attributes.
  *                               Issue with "start" command solved.
+ *    20150926  mg      1.6      The new frame has now a real timestamp as well and uses no longer the "id" as timestamp.
+ *                               This decision was made because we have the tag which identifies the new frame (tag=0).
  *
  *
  */
 
 
-#define EBX_MONITOR_VERSION "1.5"
+#define EBX_MONITOR_VERSION "1.6"
 
 
 /* --- Includes --- */
@@ -801,6 +805,7 @@ ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP)
 {
   int idx = -1;
 
+  ktime_t frame_ktime    = ktime_get();
   ktime_t newFrame_ktime = timeval_to_ktime(*inTimeOfNewFrameP);
 
   idx = atomic_add_return(1, &measureIdx_atomic);
@@ -809,7 +814,7 @@ ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP)
     printk(KERN_INFO CHARDEV_NAME": gotnewframe_real(), idx = %i, measurementIdxMax = %d\n", idx, measurementIdxMax);
 #endif
     measureP[idx].id        = newFrame_ktime;
-    measureP[idx].timeStamp = newFrame_ktime;
+    measureP[idx].timeStamp = frame_ktime;
     measureP[idx].tag       = 0; /* the tag for a new frame is always zero */
   } else {
     ebx_monitor_measurementsFinished();
@@ -838,8 +843,8 @@ ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP, const unsigne
 {
   int idx = -1;
 
-  ktime_t newFrame_ktime = timeval_to_ktime(*inTimeOfNewFrameP);
   ktime_t frame_ktime    = ktime_get();
+  ktime_t newFrame_ktime = timeval_to_ktime(*inTimeOfNewFrameP);
 
   idx = atomic_add_return(1, &measureIdx_atomic);
   if ((idx >= 0) && (idx <= measurementIdxMax)) {
