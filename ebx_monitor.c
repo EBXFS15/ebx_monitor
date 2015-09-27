@@ -80,12 +80,14 @@
  *    20150918  mg      1.3      Performance improvement: Debug output reduced, see precompiler switch EBX_DEBUG_OUTPUT.
  *                               Non blocking read access corrected.
  *    20150926  mg      1.4      Write access to start new measurement implemented, e.g. echo start > /dev/ebx_monitor
+ *    20150926  mg      1.5      Corrected device file access attributes.
+ *                               Issue with "start" command solved.
  *
  *
  */
 
 
-#define EBX_MONITOR_VERSION "1.4"
+#define EBX_MONITOR_VERSION "1.5"
 
 
 /* --- Includes --- */
@@ -168,7 +170,7 @@ static struct miscdevice ebx_monitor_misc = {
   .minor = MISC_DYNAMIC_MINOR,
   .name  = CHARDEV_NAME,
   .fops  = &cdev_fops,
-  .mode  = 00444
+  .mode  = 00666 // rw access for oug
 };
 
 static ktime_t prevFrame_ktime;
@@ -607,9 +609,10 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 static ssize_t
 ebx_monitor_write(struct file * fileP, const char __user *buf, size_t count, loff_t *f_pos)
 {
-  char cmdStart[] = "start";
-  ssize_t ret     = count;
-  char* cmdP      = NULL;
+  const char CmdStart[]  = "start";
+  const size_t CmdLength = strlen(CmdStart);
+  ssize_t ret            = count;
+  char* cmdP             = NULL;
 
   printk(KERN_INFO CHARDEV_NAME"_write: write by \"%s\" (pid %i)\n",
 	 current->comm,
@@ -636,8 +639,8 @@ ebx_monitor_write(struct file * fileP, const char __user *buf, size_t count, lof
     goto err;
   }
 
-  /* check received command */
-  if (strcmp(cmdP, cmdStart) == 1) {
+  /* check received command: command has to be "start" or begin with "start..." */
+  if (strncmp(cmdP, CmdStart, CmdLength) == 0) {
     /* Start new measurement */
     printk(KERN_INFO CHARDEV_NAME"_write: received command: %s", cmdP);
     ebx_monitor_setMonitorMode(MonitorModeDummy);
@@ -653,7 +656,7 @@ ebx_monitor_write(struct file * fileP, const char __user *buf, size_t count, lof
     ebx_monitor_setMonitorMode(MonitorModeReal);
 
   } else {
-    printk(KERN_INFO CHARDEV_NAME"_write: received NOT supported command \"%s\"\n", cmdP);
+    printk(KERN_INFO CHARDEV_NAME"_write: received NOT supported command: %s\n", cmdP);
   }
 
  err:
