@@ -87,12 +87,14 @@
  *    20150926  mg      1.6      The new frame has now a real timestamp as well and uses no longer the "id" as timestamp.
  *                               This decision was made because we have the tag which identifies the new frame (tag=0).
  *    20150926  mg      1.7      Naming convention correction.
+ *    20150926  mg      1.8      STATUS and DEBUG output removed (precompiler-switch).
+ *                               Description updated.
  *
  *
  */
 
 
-#define EBX_MONITOR_VERSION "1.7"
+#define EBX_MONITOR_VERSION "1.8"
 
 
 /* --- Includes --- */
@@ -127,36 +129,38 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Michel Grundmann");
 MODULE_DESCRIPTION("EBX Monitor to measure execution time in the kernel");
 
+/* The name of the driver */
 #define CHARDEV_NAME "ebx_monitor"
 
-#define USE_TIMER_FOR_FRAME_SIMULATION 0
+/* EBX_STATUS_OUTPUT:
+   Set to 1 to get vital debug status information */
+#define EBX_STATUS_OUTPUT 0
+/* EBX_DEBUG_OUTPUT:
+   Set to 1 to get additional, detailed debug information*/
 #define EBX_DEBUG_OUTPUT 0
+/* USE_TIMER_FOR_FRAME_SIMULATION:
+   Used to simulate frames using a timer. To test without a camera. */
+#define USE_TIMER_FOR_FRAME_SIMULATION 0
 
 
 /* --- Type definition --- */
-
+/* Defines a measure point */
 struct MeasurePointS {
   ktime_t id;
   ktime_t timeStamp;
   unsigned char tag;
 };
-static struct MeasurePointS* measureP = NULL;
-static atomic_t measureIdx_atomic     = ATOMIC_INIT(-1);
-static int measurementIdxMax          = 0;
-static int nbrOfCharactersPerMeasurePointMax = 50; /* <19-char>us, <19-char>us, tag\n  = 50 */
 
-DECLARE_KFIFO_PTR(ourCharDevFifo, char);
-
+/* Defines the possible measure modes. */
 typedef enum {
-  MonitorModeDummy,
-  MonitorModeEasy,
-  MonitorModeReal,
+  MonitorModeDummy, /* measure finished, data are protected */
+  MonitorModeEasy,  /* no measure points, check devive attribute files */
+  MonitorModeReal,  /* configured measure points, the real measure mode */
   MonitorModeUndef
 } MonitorModeEnum;
 
 
 /* --- Variable definition --- */
-
 static int ebx_monitor_open(struct inode* inodeP, struct file* fileP);
 static int ebx_monitor_release(struct inode* inodeP, struct file* fileP);
 static ssize_t ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_pos);
@@ -175,8 +179,13 @@ static struct miscdevice ebx_monitor_misc = {
   .minor = MISC_DYNAMIC_MINOR,
   .name  = CHARDEV_NAME,
   .fops  = &cdev_fops,
-  .mode  = 00666 // rw access for oug
+  .mode  = 00666 // rw access for "ugo"
 };
+
+
+/* Declare the kfifo, used fo the user space API. */
+DECLARE_KFIFO_PTR(ourCharDevFifo, char);
+
 
 static ktime_t prevFrame_ktime;
 
@@ -190,6 +199,16 @@ static atomic_t readOneShot_atomic      = ATOMIC_INIT(0);
 #include <linux/timer.h>   /* *_timer_* */
 static struct timer_list ourTimer;
 #endif
+
+/* The measure points array */
+static struct MeasurePointS* measureP = NULL;
+/* The atomic index to the array of measure points. */
+static atomic_t measureIdx_atomic     = ATOMIC_INIT(-1);
+/* The maximum index of configured measure points (see module parameter). */
+static int measurementIdxMax          = 0;
+/* The maximum number of characters per measure point */
+static int nbrOfCharactersPerMeasurePointMax = 50; /* <19-char>us, <19-char>us, tag\n  = 50 */
+
 
 /* Device data structure */
 static struct mutex      ebx_monitor_lock;  /* mutex for access exclusion */
@@ -214,6 +233,8 @@ static spinlock_t myMonitorLock;
 static int ebx_monitor_createDeviceAttributeFiles(struct device* inDeviceP);
 static void ebx_monitor_removeDeviceAttributeFiles(struct device* inDeviceP);
 static void ebx_monitor_measurementsFinished(void);
+
+/* Measurement functions are set depending on the measure mode */
 static void ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP);
 static void ebx_monitor_gotnewframe_dummy(const struct timeval* inTimeOfNewFrameP);
 static void ebx_monitor_gotnewframe_easy(const struct timeval* inTimeOfNewFrameP);
@@ -224,8 +245,11 @@ static void ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP, 
 static void ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
 static void (*ebx_monitor_gotframe_funP) (const struct timeval* inTimeOfNewFrameP, const unsigned char inTag) = ebx_monitor_gotframe_dummy;
 
+/* Set the measurement functions depending on the mode */
 static void ebx_monitor_setMonitorMode(MonitorModeEnum inMode);
 
+/* After a finished measure this function writes the data to the fifo.
+   The function is either called directly or deferred (workqueue), depending on configuration (see module parameter). */
 static void ebx_monitor_writeDataToFifo(void);
 
 #if USE_TIMER_FOR_FRAME_SIMULATION
@@ -234,8 +258,10 @@ static void ebx_monitor_initTimer(void);
 #endif
 
 
+/* The ebx monitor workqueue function in case of deferredFifo is configured (see module parameter). */
 static void ebx_monitor_workqueue(struct work_struct* inDataP);
 static DECLARE_WORK(ebx_monitor_work, ebx_monitor_workqueue);
+
 
 /* --- GLOBAL Funtions --- */
 void
@@ -271,7 +297,9 @@ __init ebx_monitor_init(void)
 {
   int result  = 0;
   int fifoMax = 0;
+#if EBX_DEBUG_OUTPUT
   unsigned int measurePointSize = sizeof(struct MeasurePointS);
+#endif
   MonitorModeEnum monitorMode = MonitorModeUndef;
   ebx_monitor_count = 0;
 
@@ -299,11 +327,13 @@ __init ebx_monitor_init(void)
     }
     measurementIdxMax = nbrOfMeasurementPoints - 1; /* -1 because the index starts with zero */
 
+#if EBX_DEBUG_OUTPUT
     printk(KERN_INFO CHARDEV_NAME": sizeof((struct MeasurePointS) = %d, measurementIdxMax = %d\n",
 	   measurePointSize,
 	   measurementIdxMax);
     printk(KERN_INFO CHARDEV_NAME": Memory used for measure points = %d Bytes\n",
 	   measurePointSize * nbrOfMeasurementPoints);
+#endif
   } /* if (nbrOfMeasurementPoints == 0) */
 
 
@@ -320,7 +350,9 @@ __init ebx_monitor_init(void)
   /* --- allocate memory for the kernel fifo --- */
   /* allocate memory only if some measurement points are configured */
   if (nbrOfMeasurementPoints > 0) {
+#if EBX_DEBUG_OUTPUT
     printk(KERN_INFO CHARDEV_NAME": Allocate kfifo memory\n");
+#endif
     result = kfifo_alloc(&ourCharDevFifo, nbrOfMeasurementPoints * nbrOfCharactersPerMeasurePointMax, GFP_KERNEL);
     if (result != 0) {
       printk(KERN_ERR CHARDEV_NAME": Error kfifo_alloc failed, result = %d\n", result);
@@ -328,7 +360,9 @@ __init ebx_monitor_init(void)
     }
     /* read the fifo size, as the size will be rounded-up to a power of 2 */
     fifoMax = kfifo_size(&ourCharDevFifo);
+#if EBX_DEBUG_OUTPUT
     printk(KERN_ERR CHARDEV_NAME": Memory used for fifo = %d Bytes\n", fifoMax);
+#endif
   }
 
   /* --- create device attribute files --- */
@@ -453,7 +487,6 @@ ebx_monitor_readOneShot_store(struct device *dev,
 
   atomic_set(&readOneShot_atomic, (int)tmp);
 
-  /* DEBUG OUTPUT */
   if (tmp == 0) {
     printk(KERN_INFO CHARDEV_NAME": One shot is deactivated\n");
   } else {
@@ -496,9 +529,11 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 
   /* TEST: just activate to simulate partial read access: count = 10; */
 
+#if EBX_STATUS_OUTPUT
   printk(KERN_INFO CHARDEV_NAME"_read: read by \"%s\" (pid %i)\n",
 	 current->comm,
 	 current->pid);
+#endif
 
   /* Get lock or signal restart if interrupted */
   if (mutex_lock_interruptible(&ebx_monitor_lock)) {
@@ -516,7 +551,9 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
 
   /* The default from 'cat' is to issue multiple reads readOneShot_atomic avoids that */
   if (atomic_read(&readOneShot_atomic) && message_read) {
+#if EBX_STATUS_OUTPUT
     printk(KERN_INFO CHARDEV_NAME"_read: ...no data available and one shot active\n");
+#endif
     mutex_unlock(&ebx_monitor_lock);
     return 0; /* just for testing using cat */
   }
@@ -528,17 +565,21 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
       goto err;
     } else {
       if (fileP->f_flags & O_NONBLOCK) {
+#if EBX_STATUS_OUTPUT
         printk(KERN_INFO CHARDEV_NAME"_read: ...no data available, return EOF\n");
+#endif
         goto err;
       }
     }
   }
 
+#if EBX_STATUS_OUTPUT
   if (fileP->f_flags & O_NONBLOCK) {
     printk(KERN_INFO CHARDEV_NAME"_read: access NON blocking\n");
   } else {
     printk(KERN_INFO CHARDEV_NAME"_read: access blocking\n");
   }
+#endif
 
   /* Return -EAGAIN if user requested O_NONBLOCK and no data available */
   if ((ebx_monitor_count == 0) && (fileP->f_flags & O_NONBLOCK)) {
@@ -547,13 +588,17 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
   }
 
   if (!(fileP->f_flags & O_NONBLOCK)) {
+#if EBX_STATUS_OUTPUT
     printk(KERN_INFO CHARDEV_NAME"_read: process blocking read access\n");
+#endif
     /* Blocking read in progress */
     /* The loop is necessary, because wait_event tests are not synchronized */
     /* In blocking mode we wait until data are available and deliver the data */
     while (ebx_monitor_count == 0) {
       if (nbrOfMeasurementPoints > 0) {
+#if EBX_STATUS_OUTPUT
 	printk(KERN_INFO CHARDEV_NAME"_read: ...no data available...wait for data...\n");
+#endif
       }
 
       /* Release lock */
@@ -595,7 +640,9 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
   /* Start new measure when all data has been read */
   if (ebx_monitor_count == 0) {
     /* All data has been read (fifo is empty), start next measurement */
+#if EBX_STATUS_OUTPUT
     printk(KERN_INFO CHARDEV_NAME"_read: ...all data read, set real mode\n");
+#endif
     ebx_monitor_setMonitorMode(MonitorModeReal);
   }
 
@@ -619,9 +666,11 @@ ebx_monitor_write(struct file * fileP, const char __user *buf, size_t count, lof
   ssize_t ret            = count;
   char* cmdP             = NULL;
 
+#if EBX_STATUS_OUTPUT
   printk(KERN_INFO CHARDEV_NAME"_write: write by \"%s\" (pid %i)\n",
 	 current->comm,
 	 current->pid);
+#endif
 
   /* Get lock or signal restart if interrupted */
   if (mutex_lock_interruptible(&ebx_monitor_lock)) {
@@ -647,17 +696,23 @@ ebx_monitor_write(struct file * fileP, const char __user *buf, size_t count, lof
   /* check received command: command has to be "start" or begin with "start..." */
   if (strncmp(cmdP, CmdStart, CmdLength) == 0) {
     /* Start new measurement */
+#if EBX_STATUS_OUTPUT
     printk(KERN_INFO CHARDEV_NAME"_write: received command: %s", cmdP);
+#endif
     ebx_monitor_setMonitorMode(MonitorModeDummy);
     ebx_monitor_count = 0;
     /* init the atomic measure array index */
     atomic_set(&measureIdx_atomic, -1);
     /* clear kfifo */
+#if EBX_DEBUG_OUTPUT
     printk(KERN_INFO CHARDEV_NAME"_write: kfifo_len is %u\n",
 	   kfifo_len(&ourCharDevFifo));
+#endif
     kfifo_reset(&ourCharDevFifo);
+#if EBX_DEBUG_OUTPUT
     printk(KERN_INFO CHARDEV_NAME"_write: kfifo_len is now %u\n",
 	   kfifo_len(&ourCharDevFifo));
+#endif
     ebx_monitor_setMonitorMode(MonitorModeReal);
 
   } else {
@@ -676,15 +731,20 @@ ebx_monitor_write(struct file * fileP, const char __user *buf, size_t count, lof
 static void
 ebx_monitor_measurementsFinished(void)
 {
+#if EBX_STATUS_OUTPUT
   printk(KERN_INFO CHARDEV_NAME": measurement finished...data available, set dummy mode\n");
+#endif
   ebx_monitor_setMonitorMode(MonitorModeDummy);
 
   if (deferredFifo == true) {
     if (schedule_work(&ebx_monitor_work) == 0) {
       printk(KERN_ERR CHARDEV_NAME": schedule_work NOT successful\n");
-    } else {
+    }
+#if EBX_STATUS_OUTPUT
+    else {
       printk(KERN_ERR CHARDEV_NAME": schedule_work successful\n");
     }
+#endif
   } else {
     ebx_monitor_writeDataToFifo();
   }
@@ -712,7 +772,9 @@ ebx_monitor_writeDataToFifo(void)
     }
   }
   ebx_monitor_count = kfifo_len(&ourCharDevFifo);
+#if EBX_STATUS_OUTPUT
   printk(KERN_INFO CHARDEV_NAME": data ready to be read (kfifo_len = %u)\n", ebx_monitor_count);
+#endif
   wake_up_interruptible(&ebx_monitor_readq);
 } /* ebx_monitor_writeDataToFifo */
 
@@ -750,7 +812,9 @@ ebx_monitor_createDeviceAttributeFiles(struct device* inDeviceP)
     goto fail;
   }
 
+#if EBX_STATUS_OUTPUT
   printk(KERN_INFO CHARDEV_NAME": result of device_create_file: %d\n", result);
+#endif
   return result;
 
  fail:
@@ -779,6 +843,7 @@ ebx_monitor_removeDeviceAttributeFiles(struct device* inDeviceP)
 static void
 ebx_monitor_gotnewframe_dummy(const struct timeval* inTimeOfNewFrameP)
 {
+  (void)inTimeOfNewFrameP;
   /* printk(KERN_INFO CHARDEV_NAME": gotnewframe_dummy() called\n"); */
 } /* ebx_monitor_gotnewframe_dummy */
 
@@ -828,6 +893,8 @@ ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP)
 static void
 ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag)
 {
+  (void)inTimeOfNewFrameP;
+  (void)inTag;
   /* printk(KERN_INFO CHARDEV_NAME": gotframe_dummy() called\n"); */
 } /* ebx_monitor_gotframe_dummy */
 
@@ -835,6 +902,8 @@ ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP, const unsign
 void
 ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag)
 {
+  (void)inTimeOfNewFrameP;
+  (void)inTag;
   /* printk(KERN_INFO CHARDEV_NAME": gotframe_easy() called\n"); */
 } /* ebx_monitor_gotframe_easy */
 
@@ -875,14 +944,18 @@ ebx_monitor_setMonitorMode(MonitorModeEnum inMode)
     spin_unlock_irqrestore(&myMonitorLock, iflags);
     break;
   case MonitorModeReal:
+#if EBX_STATUS_OUTPUT
     printk(KERN_INFO CHARDEV_NAME": --- START Measurement ---\n");
+#endif
     spin_lock_irqsave(&myMonitorLock, iflags);
     ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_real;
     ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_real;
     spin_unlock_irqrestore(&myMonitorLock, iflags);
     break;
   case MonitorModeDummy:
+#if EBX_STATUS_OUTPUT
     printk(KERN_INFO CHARDEV_NAME": --- STOP Measurement ---\n");
+#endif
     spin_lock_irqsave(&myMonitorLock, iflags);
     ebx_monitor_gotnewframe_funP = ebx_monitor_gotnewframe_dummy;
     ebx_monitor_gotframe_funP    = ebx_monitor_gotframe_dummy;
@@ -899,7 +972,9 @@ ebx_monitor_setMonitorMode(MonitorModeEnum inMode)
 static void
 ebx_monitor_workqueue(struct work_struct* inDataP)
 {
+#if EBX_STATUS_OUTPUT
   printk(KERN_INFO CHARDEV_NAME"_workqueue: triggers ebx_monitor_writeDataToFifo()\n");
+#endif
   ebx_monitor_writeDataToFifo();
 } /* ebx_monitor_workqueue */
 
