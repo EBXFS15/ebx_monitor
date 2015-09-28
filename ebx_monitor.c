@@ -86,12 +86,13 @@
  *                               Issue with "start" command solved.
  *    20150926  mg      1.6      The new frame has now a real timestamp as well and uses no longer the "id" as timestamp.
  *                               This decision was made because we have the tag which identifies the new frame (tag=0).
+ *    20150926  mg      1.7      Naming convention correction.
  *
  *
  */
 
 
-#define EBX_MONITOR_VERSION "1.6"
+#define EBX_MONITOR_VERSION "1.7"
 
 
 /* --- Includes --- */
@@ -233,8 +234,8 @@ static void ebx_monitor_initTimer(void);
 #endif
 
 
-static void workqueue_function(struct work_struct* inDataP);
-static DECLARE_WORK(work, workqueue_function);
+static void ebx_monitor_workqueue(struct work_struct* inDataP);
+static DECLARE_WORK(ebx_monitor_work, ebx_monitor_workqueue);
 
 /* --- GLOBAL Funtions --- */
 void
@@ -679,7 +680,7 @@ ebx_monitor_measurementsFinished(void)
   ebx_monitor_setMonitorMode(MonitorModeDummy);
 
   if (deferredFifo == true) {
-    if (schedule_work(&work) == 0) {
+    if (schedule_work(&ebx_monitor_work) == 0) {
       printk(KERN_ERR CHARDEV_NAME": schedule_work NOT successful\n");
     } else {
       printk(KERN_ERR CHARDEV_NAME": schedule_work successful\n");
@@ -896,11 +897,11 @@ ebx_monitor_setMonitorMode(MonitorModeEnum inMode)
 
 
 static void
-workqueue_function(struct work_struct* inDataP)
+ebx_monitor_workqueue(struct work_struct* inDataP)
 {
-  printk(KERN_INFO CHARDEV_NAME": workqueue_function() triggers ebx_monitor_writeDataToFifo()\n");
+  printk(KERN_INFO CHARDEV_NAME"_workqueue: triggers ebx_monitor_writeDataToFifo()\n");
   ebx_monitor_writeDataToFifo();
-} /* workqueue_function */
+} /* ebx_monitor_workqueue */
 
 
 #if USE_TIMER_FOR_FRAME_SIMULATION
