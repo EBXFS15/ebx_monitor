@@ -89,12 +89,13 @@
  *    20150926  mg      1.7      Naming convention correction.
  *    20150926  mg      1.8      STATUS and DEBUG output removed (precompiler-switch).
  *                               Description updated.
+ *    20150926  mg      1.9      Description updated.
  *
  *
  */
 
 
-#define EBX_MONITOR_VERSION "1.8"
+#define EBX_MONITOR_VERSION "1.9"
 
 
 /* --- Includes --- */
@@ -166,6 +167,7 @@ static int ebx_monitor_release(struct inode* inodeP, struct file* fileP);
 static ssize_t ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_pos);
 static ssize_t ebx_monitor_write(struct file * fileP, const char __user *buf, size_t count, loff_t *f_pos);
 
+/* Declare file operations */
 static struct file_operations cdev_fops = {
   .owner   = THIS_MODULE,
   .open    = ebx_monitor_open,
@@ -175,6 +177,7 @@ static struct file_operations cdev_fops = {
   .llseek  = no_llseek
 };
 
+/* Define EBX Monitor device */
 static struct miscdevice ebx_monitor_misc = {
   .minor = MISC_DYNAMIC_MINOR,
   .name  = CHARDEV_NAME,
@@ -187,12 +190,15 @@ static struct miscdevice ebx_monitor_misc = {
 DECLARE_KFIFO_PTR(ourCharDevFifo, char);
 
 
+/* Used to calculate the last frame delta, only used in ebx_monitor_gotnewframe_easy() */
 static ktime_t prevFrame_ktime;
-
+/* The following atomic variables are only used in easy mode */
 static atomic_t totalFrameCount_atomic  = ATOMIC_INIT(0);
 static atomic_t totalFrameDelta_atomic  = ATOMIC_INIT(0);
 static atomic_t lastFrameDelta_atomic   = ATOMIC_INIT(0);
 static atomic_t averageFrameTime_atomic = ATOMIC_INIT(0);
+
+/* Simulate non-blocking read using cat */
 static atomic_t readOneShot_atomic      = ATOMIC_INIT(0);
 
 #if USE_TIMER_FOR_FRAME_SIMULATION
@@ -212,47 +218,63 @@ static int nbrOfCharactersPerMeasurePointMax = 50; /* <19-char>us, <19-char>us, 
 
 /* Device data structure */
 static struct mutex      ebx_monitor_lock;  /* mutex for access exclusion */
-static wait_queue_head_t ebx_monitor_readq; /* read queue for blocking */
+static wait_queue_head_t ebx_monitor_readq; /* read queue for blocking read */
 static ssize_t           ebx_monitor_count; /* number of bytes to be read */
 
 static bool message_read; /* just for testing using cat */
 
+/* Handle the configured number of measure points */
 static int MaxNbrOfMeasurementPoints = 1000;
 static int nbrOfMeasurementPoints = 0;
 module_param(nbrOfMeasurementPoints, uint, S_IRUGO);
 MODULE_PARM_DESC(nbrOfMeasurementPoints, " The number of measure points in the kernel (default=0, maximum=1000)");
 
+/* Handle deferred fifo configuration */
 static bool deferredFifo = false;
 module_param(deferredFifo, bool, S_IRUGO);
 MODULE_PARM_DESC(deferredFifo, " Deferred fifo availability (default=N)");
 
+/* Protect the modification of the function pointers */
 static spinlock_t myMonitorLock;
 
 
 /* --- Function Prototypes --- */
+/* Create all device attribute files depending on the module configuration */
 static int ebx_monitor_createDeviceAttributeFiles(struct device* inDeviceP);
+/* Remove all device attribute files */
 static void ebx_monitor_removeDeviceAttributeFiles(struct device* inDeviceP);
+/* Write measure data to fifo. Depending on the module configuration this is
+   done immediately or deferred, in a work-queue */
 static void ebx_monitor_measurementsFinished(void);
 
 /* Measurement functions are set depending on the measure mode */
+/* The real measurement mode */
 static void ebx_monitor_gotnewframe_real(const struct timeval* inTimeOfNewFrameP);
-static void ebx_monitor_gotnewframe_dummy(const struct timeval* inTimeOfNewFrameP);
-static void ebx_monitor_gotnewframe_easy(const struct timeval* inTimeOfNewFrameP);
-static void (*ebx_monitor_gotnewframe_funP) (const struct timeval* inTimeOfNewFrameP) = ebx_monitor_gotnewframe_dummy;
-
 static void ebx_monitor_gotframe_real(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
+
+/* The dummy mode, data can be read from user space */
+static void ebx_monitor_gotnewframe_dummy(const struct timeval* inTimeOfNewFrameP);
 static void ebx_monitor_gotframe_dummy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
+
+/* The easy mode, no measure points are configured. Some information available via sys-fs */
+static void ebx_monitor_gotnewframe_easy(const struct timeval* inTimeOfNewFrameP);
 static void ebx_monitor_gotframe_easy(const struct timeval* inTimeOfNewFrameP, const unsigned char inTag);
+
+/* Measurement functions are default initialised to dummy mode */
+static void (*ebx_monitor_gotnewframe_funP) (const struct timeval* inTimeOfNewFrameP) = ebx_monitor_gotnewframe_dummy;
 static void (*ebx_monitor_gotframe_funP) (const struct timeval* inTimeOfNewFrameP, const unsigned char inTag) = ebx_monitor_gotframe_dummy;
+
 
 /* Set the measurement functions depending on the mode */
 static void ebx_monitor_setMonitorMode(MonitorModeEnum inMode);
 
 /* After a finished measure this function writes the data to the fifo.
-   The function is either called directly or deferred (workqueue), depending on configuration (see module parameter). */
+   The function is either called directly or deferred (workqueue), depending on configuration (see module parameter).
+   After the data have been written to the fifo the read wait queue is released. */
 static void ebx_monitor_writeDataToFifo(void);
 
 #if USE_TIMER_FOR_FRAME_SIMULATION
+/* The following functions are only used to test the EBX Monitor without a camera */
 static void ebx_monitor_timer_expired(unsigned long inData);
 static void ebx_monitor_initTimer(void);
 #endif
@@ -649,7 +671,6 @@ ebx_monitor_read(struct file *fileP, char __user *buf, size_t count, loff_t *f_p
   /* Unlock and signal writers */
   mutex_unlock(&ebx_monitor_lock);
 
-  //TODO...trigger possible next statistic...  wake_up_interruptible(&ebx_monitor_writeq);
   return ret ? ret : copied;
 
  err:
@@ -775,6 +796,7 @@ ebx_monitor_writeDataToFifo(void)
 #if EBX_STATUS_OUTPUT
   printk(KERN_INFO CHARDEV_NAME": data ready to be read (kfifo_len = %u)\n", ebx_monitor_count);
 #endif
+  /* Data written to fifo, release wait queue */
   wake_up_interruptible(&ebx_monitor_readq);
 } /* ebx_monitor_writeDataToFifo */
 
